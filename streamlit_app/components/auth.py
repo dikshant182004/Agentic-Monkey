@@ -1,32 +1,25 @@
-"""Auth helpers for Streamlit frontend session handling."""
+"""Auth helpers using Streamlit native OIDC (st.login / st.user)."""
 
-from jose import jwt
+from __future__ import annotations
+
 import streamlit as st
-
-from streamlit_app.config import BACKEND_URL
 
 
 def require_login() -> None:
-    """Require token in query params or session state and stop page otherwise."""
-    token = st.query_params.get("token")
-    if "jwt_token" not in st.session_state:
-        st.session_state.jwt_token = ""
-    if token:
-        st.session_state.jwt_token = token
-        st.query_params.clear()
-    if not st.session_state.jwt_token:
+    """Ensure user is logged in via Streamlit OIDC or stop the page."""
+    if not getattr(st, "user", None) or not getattr(st.user, "is_logged_in", False):
         st.title("ChaosAgent Login")
-        st.link_button("Login with Google", f"{BACKEND_URL}/auth/google")
-        st.stop()
-    try:
-        jwt.get_unverified_claims(st.session_state.jwt_token)
-    except Exception:
-        st.session_state.jwt_token = ""
-        st.error("Session token invalid. Please login again.")
+        if st.button("Log in with Google"):
+            st.login()
         st.stop()
 
 
 def get_headers() -> dict[str, str]:
-    """Return auth headers for backend API calls."""
-    return {"Authorization": f"Bearer {st.session_state.jwt_token}"}
+    """Return backend auth headers using exposed OIDC ID token."""
+    token = ""
+    try:
+        token = st.user.tokens["id"]
+    except Exception:
+        token = ""
+    return {"Authorization": f"Bearer {token}"} if token else {}
 

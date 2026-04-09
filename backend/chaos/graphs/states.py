@@ -71,6 +71,7 @@ class OrchestratorState(TypedDict):
     hitl_pending: bool
     hitl_interaction_id: Optional[str]
     hitl_decision: Optional[Literal["approved", "rejected"]]
+    hitl_required: bool
     status: Literal["running", "paused_hitl", "paused_blast", "complete", "failed"]
     final_report: Optional[dict]
     current_monkey: str
@@ -80,4 +81,14 @@ class OrchestratorState(TypedDict):
     current_safety_score: float
     current_is_afp: bool
     current_severity: str
+    current_srq_score: float
+    current_hrt_score: float
+    current_reasoning_score: float
+    current_tool_recovery_score: float
+    current_self_corrected: bool
+    current_notes: str
+    current_afp_description: str
+    current_openpipe_request_id: str
+    current_interaction_id: str
+    current_token_cost_usd: float
 

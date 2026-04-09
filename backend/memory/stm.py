@@ -15,6 +15,7 @@ def init_stm(steady_state: dict) -> dict:
         "running_srq": steady_state.get("baseline_srq", 0.0),
         "hitl_pending": False,
         "hitl_interaction_id": None,
+        "hitl_required": False,
         "hitl_decision": None,
         "status": "running",
         "final_report": None,

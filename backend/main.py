@@ -14,7 +14,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
 from backend.api import agents, finetune, hitl, runs, steady_state
-from backend.auth.google_oauth import router as auth_router
 from backend.config import settings
 from backend.db.session import AsyncSessionFactory
 from backend.memory.redis_checkpointer import get_redis_checkpointer
@@ -45,7 +44,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth_router)
 app.include_router(agents.router)
 app.include_router(steady_state.router)
 app.include_router(runs.router)

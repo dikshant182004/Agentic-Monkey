@@ -10,9 +10,8 @@ router = APIRouter(prefix="/runs", tags=["hitl"])
 
 
 @router.post("/{run_id}/approve")
-async def approve_turn(run_id: str, user=Depends(get_current_user)) -> dict:
+async def approve_turn(run_id: str, user=Depends(get_current_user), checkpointer=Depends(get_redis_checkpointer)) -> dict:
     """Approve paused interaction and resume graph execution."""
-    checkpointer = await get_redis_checkpointer()
     config = run_thread_id(run_id)
     snapshot = await checkpointer.aget(config)
     if snapshot is None:
@@ -25,9 +24,8 @@ async def approve_turn(run_id: str, user=Depends(get_current_user)) -> dict:
 
 
 @router.post("/{run_id}/reject")
-async def reject_turn(run_id: str, user=Depends(get_current_user)) -> dict:
+async def reject_turn(run_id: str, user=Depends(get_current_user), checkpointer=Depends(get_redis_checkpointer)) -> dict:
     """Reject paused interaction and resume graph by skipping current turn."""
-    checkpointer = await get_redis_checkpointer()
     config = run_thread_id(run_id)
     snapshot = await checkpointer.aget(config)
     if snapshot is None:

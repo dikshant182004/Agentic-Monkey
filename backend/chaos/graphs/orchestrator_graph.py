@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import itertools
 from datetime import datetime, timezone
+from uuid import uuid4
 
 from langgraph.graph import END, StateGraph
 
@@ -12,9 +13,12 @@ from backend.a2a.parser import AgentConfig
 from backend.chaos.graph_runner import run_evaluator, run_scenario_generator
 from backend.chaos.graphs.states import OrchestratorState
 from backend.injectors.cti_monkey import contradictory_instructions
-from backend.memory.ltm import load_steady_state, write_afp_to_ltm
+from backend.db import crud
+from backend.db.session import AsyncSessionFactory
+from backend.memory.ltm import load_steady_state
 from backend.memory.stm import init_stm, update_stm_with_turn
 from backend.openpipe.tagger import tag_interaction
+from backend.evaluation.report import build_report
 
 BLAST_RADIUS_LIMITS = {
     "dev": {"max_turns": 100, "max_cost_usd": 10.0, "parallel": True},
@@ -79,7 +83,7 @@ async def call_target_agent(state: OrchestratorState) -> OrchestratorState:
 
 
 async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
-    """Run evaluator graph, update STM turn metrics, and persist AFP patterns."""
+    """Run evaluator graph and stage turn scores for log_and_continue."""
     eval_state = await run_evaluator(
         {
             "agent_id": state["agent_id"],
@@ -103,41 +107,22 @@ async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
         },
         run_id=state["run_id"],
     )
-    turn_result = {
-        "turn": state["current_turn"],
-        "monkey_type": state["current_monkey"],
-        "srq_score": eval_state["srq_score"],
-        "hrt_score": eval_state["hrt_score"],
-        "safety_score": eval_state["safety_score"],
-        "reasoning_score": eval_state["reasoning_score"],
-        "tool_recovery_score": eval_state["tool_recovery_score"],
-        "is_afp": eval_state["is_afp"],
-        "severity": eval_state["severity"],
-        "notes": eval_state["notes"],
-        "openpipe_request_id": eval_state["openpipe_request_id"],
-        "token_cost": 0.0,
-    }
-    updated = update_stm_with_turn(state, turn_result)
-    await tag_interaction(eval_state["openpipe_request_id"], float(eval_state["safety_score"]), state["current_monkey"])
-    if eval_state["is_afp"]:
-        await write_afp_to_ltm(
-            {
-                "run_id": state["run_id"],
-                "interaction_id": state["run_id"],
-                "monkey_type": state["current_monkey"],
-                "prompt": state["current_prompt"],
-                "agent_response": state["current_response"],
-                "description": eval_state["afp_description"],
-                "severity": eval_state["severity"],
-                "recommendation": eval_state["notes"],
-            },
-            agent_id=state["agent_id"],
-        )
+    staged_interaction_id = state.get("current_interaction_id") or str(uuid4())
     return {
-        **updated,
+        **state,
+        "current_interaction_id": staged_interaction_id,
+        "current_srq_score": eval_state["srq_score"],
+        "current_hrt_score": eval_state["hrt_score"],
         "current_safety_score": eval_state["safety_score"],
-        "current_is_afp": eval_state["is_afp"],
-        "current_severity": eval_state["severity"],
+        "current_reasoning_score": eval_state["reasoning_score"],
+        "current_tool_recovery_score": eval_state["tool_recovery_score"],
+        "current_is_afp": bool(eval_state["is_afp"]),
+        "current_self_corrected": bool(eval_state["self_corrected"]),
+        "current_notes": str(eval_state["notes"]),
+        "current_severity": str(eval_state["severity"]),
+        "current_afp_description": str(eval_state["afp_description"]),
+        "current_openpipe_request_id": str(eval_state["openpipe_request_id"]),
+        "current_token_cost_usd": 0.0,
     }
 
 
@@ -147,17 +132,90 @@ async def hitl_gate(state: OrchestratorState) -> OrchestratorState:
         state.get("current_is_afp") and state.get("current_severity") == "critical"
     )
     if needs_hitl:
-        return {**state, "hitl_pending": True, "status": "paused_hitl"}
-    return {**state, "hitl_pending": False}
+        return {
+            **state,
+            "hitl_pending": True,
+            "hitl_required": True,
+            "hitl_interaction_id": state.get("current_interaction_id"),
+            "status": "paused_hitl",
+        }
+    return {**state, "hitl_pending": False, "hitl_required": False, "hitl_interaction_id": None}
 
 
 async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
-    """Increment turn counter and clear HITL decision state for next cycle."""
+    """Persist interaction to DB, optionally write AFPs, update STM, then advance."""
+    async with AsyncSessionFactory() as session:
+        await crud.create_interaction(
+            session=session,
+            interaction_id=state["current_interaction_id"],
+            run_id=state["run_id"],
+            turn=state["current_turn"],
+            monkey_type=state["current_monkey"],
+            prompt=state["current_prompt"],
+            agent_response=state["current_response"],
+            failure_injected="",
+            srq_score=state["current_srq_score"],
+            hrt_score=state["current_hrt_score"],
+            safety_score=state["current_safety_score"],
+            reasoning_score=state["current_reasoning_score"],
+            tool_recovery_score=state["current_tool_recovery_score"],
+            is_afp=state["current_is_afp"],
+            self_corrected=state["current_self_corrected"],
+            hitl_required=state["hitl_required"],
+            hitl_decision=state["hitl_decision"],
+            openpipe_request_id=state["current_openpipe_request_id"],
+            notes=state["current_notes"],
+        )
+
+        # Tag in OpenPipe after scores are committed (best-effort).
+        await tag_interaction(
+            state["current_openpipe_request_id"],
+            float(state["current_safety_score"]),
+            state["current_monkey"],
+        )
+
+        if state["current_is_afp"]:
+            await crud.create_afp(
+                session=session,
+                afp_id=str(uuid4()),
+                run_id=state["run_id"],
+                interaction_id=state["current_interaction_id"],
+                agent_id=state["agent_id"],
+                monkey_type=state["current_monkey"],
+                prompt=state["current_prompt"],
+                agent_response=state["current_response"],
+                description=state["current_afp_description"],
+                severity=state["current_severity"],
+                recommendation=state["current_notes"],
+            )
+
+        # Update STM after persistence (so checkpoints contain latest turn_scores).
+        turn_result = {
+            "turn": state["current_turn"],
+            "monkey_type": state["current_monkey"],
+            "srq_score": state["current_srq_score"],
+            "hrt_score": state["current_hrt_score"],
+            "safety_score": state["current_safety_score"],
+            "reasoning_score": state["current_reasoning_score"],
+            "tool_recovery_score": state["current_tool_recovery_score"],
+            "is_afp": state["current_is_afp"],
+            "severity": state["current_severity"],
+            "notes": state["current_notes"],
+            "openpipe_request_id": state["current_openpipe_request_id"],
+            "token_cost": state.get("current_token_cost_usd", 0.0),
+        }
+        updated = update_stm_with_turn(state, turn_result)
+
+        await session.commit()
+
     return {
-        **state,
+        **updated,
         "current_turn": state["current_turn"] + 1,
         "hitl_pending": False,
         "hitl_decision": None,
+        "hitl_required": False,
+        "hitl_interaction_id": None,
+        "status": "running",
     }
 
 
@@ -172,17 +230,26 @@ def check_blast_radius(state: OrchestratorState) -> str:
 
 
 async def finalize_run(state: OrchestratorState) -> OrchestratorState:
-    """Compute final aggregates and set terminal run status."""
+    """Compute final aggregates and persist final Run record."""
     scores = state["turn_scores"]
     count = max(len(scores), 1)
-    final_report = {
-        "run_id": state["run_id"],
-        "overall_srq": sum(s["srq_score"] for s in scores) / count if scores else 0.0,
-        "overall_hrt": sum(s["hrt_score"] for s in scores) / count if scores else 0.0,
-        "overall_safety": sum(s["safety_score"] for s in scores) / count if scores else 0.0,
-        "afp_count": sum(1 for s in scores if s.get("is_afp")),
-        "finished_at": datetime.now(timezone.utc).isoformat(),
-    }
+    final_report = build_report(state["run_id"], scores)
+    async with AsyncSessionFactory() as session:
+        await crud.update_run_final(
+            session=session,
+            run_id=state["run_id"],
+            status="complete",
+            blast_radius=state["blast_radius"],
+            monkeys_selected=state["monkeys_selected"],
+            overall_srq=final_report["overall_srq"],
+            overall_hrt=final_report["overall_hrt"],
+            overall_safety=final_report["overall_safety"],
+            afp_count=final_report["afp_count"],
+            ethical_drift_score=0.0,
+            agentic_resilience_score=final_report.get("agentic_resilience_score", 0.0),
+            estimated_cost_usd=state.get("estimated_cost_usd", 0.0),
+            finished_at=datetime.now(timezone.utc),
+        )
     return {**state, "status": "complete", "final_report": final_report}
 
 

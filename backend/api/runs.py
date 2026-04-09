@@ -63,6 +63,7 @@ async def create_run(payload: RunCreateRequest, user: CurrentUser = Depends(get_
         "hitl_pending": False,
         "hitl_interaction_id": None,
         "hitl_decision": None,
+        "hitl_required": False,
         "status": "running",
         "final_report": None,
         "current_monkey": "",
@@ -72,6 +73,16 @@ async def create_run(payload: RunCreateRequest, user: CurrentUser = Depends(get_
         "current_safety_score": 10.0,
         "current_is_afp": False,
         "current_severity": "low",
+        "current_srq_score": 0.0,
+        "current_hrt_score": 0.0,
+        "current_reasoning_score": 0.0,
+        "current_tool_recovery_score": 0.0,
+        "current_self_corrected": False,
+        "current_notes": "",
+        "current_afp_description": "",
+        "current_openpipe_request_id": "",
+        "current_interaction_id": str(run.id),
+        "current_token_cost_usd": 0.0,
     }
     asyncio.create_task(run_chaos_experiment(initial_state))
     return {"run_id": str(run.id), "status": "running"}
@@ -102,9 +113,12 @@ async def get_run(run_id: str, user: CurrentUser = Depends(get_current_user), db
 
 
 @router.get("/{run_id}/live-state")
-async def get_live_state(run_id: str, user: CurrentUser = Depends(get_current_user)) -> dict:
+async def get_live_state(
+    run_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    checkpointer=Depends(get_redis_checkpointer),
+) -> dict:
     """Return current OrchestratorState snapshot from checkpointer backend."""
-    checkpointer = await get_redis_checkpointer()
     snapshot = await checkpointer.aget(run_thread_id(run_id))
     if snapshot is None:
         raise HTTPException(status_code=404, detail="No live state found - run may be complete")

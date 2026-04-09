@@ -57,7 +57,11 @@ def generate_adversarial_prompt(state: ScenarioGenState) -> ScenarioGenState:
             ),
         },
     ]
-    content, request_id = llm_call(messages, tags={"flow": "scenario_gen", "monkey_type": state["monkey_type"]})
+    content, request_id = llm_call(
+        messages,
+        tags={"flow": "scenario_gen", "monkey_type": state["monkey_type"]},
+        purpose="scenario_gen",
+    )
     parsed = _safe_json_parse(content)
     return {
         **state,

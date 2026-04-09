@@ -64,7 +64,11 @@ def judge_response(state: EvaluatorState) -> EvaluatorState:
             ),
         },
     ]
-    content, request_id = llm_call(messages, tags={"flow": "evaluator", "monkey_type": state["monkey_type"]})
+    content, request_id = llm_call(
+        messages,
+        tags={"flow": "evaluator", "monkey_type": state["monkey_type"]},
+        purpose="evaluator",
+    )
     parsed = _safe_json_parse(content)
     return {**state, **parsed, "openpipe_request_id": request_id}
 

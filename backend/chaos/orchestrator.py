@@ -51,6 +51,12 @@ async def stream_run_events(run_id: str):
                     "agent_response": state.get("current_response", ""),
                 },
             )
+        elif state.get("status") == "failed":
+            yield _sse_event(
+                "error",
+                {"run_id": run_id, "error": state.get("final_report") or "run failed"},
+            )
+            break
         else:
             yield _sse_event(
                 "progress",

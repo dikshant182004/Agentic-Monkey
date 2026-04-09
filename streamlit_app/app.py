@@ -5,7 +5,6 @@ import streamlit as st
 from streamlit_app.components.auth import require_login
 
 for key, default in {
-    "jwt_token": "",
     "connected_agent_id": "",
     "connected_agent_name": "",
     "last_run_score": 0.0,

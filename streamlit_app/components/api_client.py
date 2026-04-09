@@ -33,3 +33,52 @@ def create_run(payload: dict) -> dict:
     response.raise_for_status()
     return response.json()
 
+
+def get_live_state(run_id: str) -> dict:
+    """Fetch live orchestrator state snapshot for an active run."""
+    response = requests.get(f"{BACKEND_URL}/runs/{run_id}/live-state", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def approve_turn(run_id: str) -> dict:
+    """Approve a paused HITL turn and resume the graph."""
+    response = requests.post(f"{BACKEND_URL}/runs/{run_id}/approve", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def reject_turn(run_id: str) -> dict:
+    """Reject a paused HITL turn and resume the graph (skip)."""
+    response = requests.post(f"{BACKEND_URL}/runs/{run_id}/reject", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def finetune_stats() -> dict:
+    """Get OpenPipe fine-tune dataset stats."""
+    response = requests.get(f"{BACKEND_URL}/finetune/stats", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def finetune_trigger() -> dict:
+    """Trigger OpenPipe fine-tune job."""
+    response = requests.post(f"{BACKEND_URL}/finetune/trigger", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def finetune_status(job_id: str) -> dict:
+    """Poll OpenPipe fine-tune status."""
+    response = requests.get(f"{BACKEND_URL}/finetune/status/{job_id}", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+
+
+def finetune_activate(model_id: str) -> dict:
+    """Activate a specific fine-tuned model."""
+    response = requests.post(f"{BACKEND_URL}/finetune/activate/{model_id}", headers=get_headers(), timeout=30)
+    response.raise_for_status()
+    return response.json()
+

@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+from uuid import UUID
+
 from sqlalchemy import delete, desc, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.db.models import AFP, Agent, Run, SteadyState, User
+from backend.db.models import AFP, Agent, Interaction, Run, SteadyState, User
 
 
 async def get_or_create_user(session: AsyncSession, email: str, name: str) -> User:
@@ -80,4 +83,120 @@ async def load_afp_patterns(session: AsyncSession, agent_id: str, monkey_type: s
         .limit(limit)
     )
     return list(rows)
+
+
+async def create_interaction(
+    session: AsyncSession,
+    interaction_id: str,
+    run_id: str,
+    turn: int,
+    monkey_type: str,
+    prompt: str,
+    agent_response: str,
+    failure_injected: str,
+    srq_score: float,
+    hrt_score: float,
+    safety_score: float,
+    reasoning_score: float,
+    tool_recovery_score: float,
+    is_afp: bool,
+    self_corrected: bool,
+    hitl_required: bool,
+    hitl_decision: str | None,
+    openpipe_request_id: str,
+    notes: str,
+) -> None:
+    """Insert a turn interaction outcome record."""
+    interaction_uuid = UUID(interaction_id)
+    run_uuid = UUID(run_id)
+    session.add(
+        Interaction(
+            id=interaction_uuid,
+            run_id=run_uuid,
+            turn=turn,
+            monkey_type=monkey_type,
+            prompt=prompt,
+            agent_response=agent_response,
+            failure_injected=failure_injected,
+            srq_score=srq_score,
+            hrt_score=hrt_score,
+            safety_score=safety_score,
+            reasoning_score=reasoning_score,
+            tool_recovery_score=tool_recovery_score,
+            is_afp=is_afp,
+            self_corrected=self_corrected,
+            hitl_required=hitl_required,
+            hitl_decision=hitl_decision,
+            openpipe_request_id=openpipe_request_id,
+            notes=notes,
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    await session.commit()
+
+
+async def create_afp(
+    session: AsyncSession,
+    afp_id: str,
+    run_id: str,
+    interaction_id: str,
+    agent_id: str,
+    monkey_type: str,
+    prompt: str,
+    agent_response: str,
+    description: str,
+    severity: str,
+    recommendation: str,
+) -> None:
+    """Insert an AFP discovery for long-term memory."""
+    session.add(
+        AFP(
+            id=UUID(afp_id),
+            run_id=UUID(run_id),
+            interaction_id=UUID(interaction_id),
+            agent_id=UUID(agent_id),
+            monkey_type=monkey_type,
+            prompt=prompt,
+            agent_response=agent_response,
+            description=description,
+            severity=severity,
+            recommendation=recommendation,
+            created_at=datetime.now(timezone.utc),
+        )
+    )
+    await session.commit()
+
+
+async def update_run_final(
+    session: AsyncSession,
+    run_id: str,
+    status: str,
+    blast_radius: str,
+    monkeys_selected: object,
+    overall_srq: float,
+    overall_hrt: float,
+    overall_safety: float,
+    afp_count: int,
+    ethical_drift_score: float,
+    agentic_resilience_score: float,
+    estimated_cost_usd: float,
+    finished_at: datetime,
+) -> None:
+    """Update terminal run record metrics in PostgreSQL."""
+    run_uuid = UUID(run_id)
+    run = await session.scalar(select(Run).where(Run.id == run_uuid))
+    if run is None:
+        return
+    run.status = status
+    run.blast_radius = blast_radius
+    run.monkeys_selected = monkeys_selected
+    run.overall_srq = overall_srq
+    run.overall_hrt = overall_hrt
+    run.overall_safety = overall_safety
+    run.afp_count = afp_count
+    run.ethical_drift_score = ethical_drift_score
+    run.agentic_resilience_score = agentic_resilience_score
+    run.estimated_cost_usd = estimated_cost_usd
+    run.finished_at = finished_at
+    await session.commit()
 
