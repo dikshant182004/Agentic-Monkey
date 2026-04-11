@@ -1,11 +1,12 @@
 """Streamlit page for uploading and validating target Agent Card."""
 
 import streamlit as st
-
 from streamlit_app.components.api_client import create_agent
 from streamlit_app.components.auth import require_login
 
+st.set_page_config(page_title="ChaosAgent - Connect Agent", layout="wide")
 require_login()
+
 st.title("1. Connect Agent")
 card_file = st.file_uploader("Upload Agent Card", type=["json", "yaml", "txt"])
 raw_text = st.text_area("Or paste raw card JSON/YAML/URL")

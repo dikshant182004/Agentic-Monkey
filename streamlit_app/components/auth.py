@@ -7,10 +7,9 @@ import streamlit as st
 
 def require_login() -> None:
     """Ensure user is logged in via Streamlit OIDC or stop the page."""
-    if not getattr(st, "user", None) or not getattr(st.user, "is_logged_in", False):
+    if not st.user.is_logged_in:
         st.title("ChaosAgent Login")
-        if st.button("Log in with Google"):
-            st.login()
+        st.button("Log in with Google", on_click=st.login)
         st.stop()
 
 
@@ -22,4 +21,3 @@ def get_headers() -> dict[str, str]:
     except Exception:
         token = ""
     return {"Authorization": f"Bearer {token}"} if token else {}
-
