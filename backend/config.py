@@ -28,7 +28,7 @@ class Settings(BaseSettings):
     redis_url: str = Field(default="redis://localhost:6379", alias="REDIS_URL")
     redis_checkpoint_ttl_hours: int = Field(default=24, alias="REDIS_CHECKPOINT_TTL_HOURS")
     database_url: str = Field(
-        default="postgresql+asyncpg://postgres:chaos123@localhost:5432/chaosagent",
+        default="postgresql+asyncpg://postgres:chaos123@localhost:5433/chaosagent",
         alias="DATABASE_URL",
     )
     streamlit_url: str = Field(default="http://localhost:8501", alias="STREAMLIT_URL")
