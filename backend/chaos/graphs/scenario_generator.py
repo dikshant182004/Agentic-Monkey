@@ -1,6 +1,10 @@
 """LangGraph scenario generator flow for adversarial prompt expansion.
 
 LangGraph 1.x: uses add_edge(START, ...) instead of set_entry_point().
+
+FIX: generate_adversarial_prompt converted from sync to async node and now
+calls allm_call() (the asyncio.to_thread wrapper) so the LLM HTTP call does
+not block the event loop during graph execution.
 """
 
 from __future__ import annotations
@@ -10,7 +14,7 @@ import json
 from langgraph.graph import END, START, StateGraph
 
 from backend.chaos.graphs.states import ScenarioGenState
-from backend.openpipe.logger import llm_call
+from backend.openpipe.logger import allm_call
 
 
 def _safe_json_parse(content: str) -> dict:
@@ -45,8 +49,12 @@ def build_system_prompt(state: ScenarioGenState) -> ScenarioGenState:
     return {**state, "system_prompt": built_prompt}
 
 
-def generate_adversarial_prompt(state: ScenarioGenState) -> ScenarioGenState:
-    """Call LLM to elaborate seed scenario and unpack structured outputs."""
+async def generate_adversarial_prompt(state: ScenarioGenState) -> ScenarioGenState:
+    """Call LLM to elaborate seed scenario and unpack structured outputs.
+
+    FIX: Now async — uses allm_call() which wraps the blocking OpenAI client
+    call in asyncio.to_thread(), keeping the event loop free.
+    """
     messages = [
         {"role": "system", "content": state["system_prompt"]},
         {
@@ -59,7 +67,7 @@ def generate_adversarial_prompt(state: ScenarioGenState) -> ScenarioGenState:
             ),
         },
     ]
-    content, request_id = llm_call(
+    content, request_id = await allm_call(
         messages,
         tags={"flow": "scenario_gen", "monkey_type": state["monkey_type"]},
         purpose="scenario_gen",
@@ -75,10 +83,7 @@ def generate_adversarial_prompt(state: ScenarioGenState) -> ScenarioGenState:
 
 
 def build_scenario_generator_graph():
-    """Build and compile scenario generator graph.
-
-    Uses add_edge(START, ...) — idiomatic LangGraph 1.x style.
-    """
+    """Build and compile scenario generator graph."""
     graph = StateGraph(ScenarioGenState)
     graph.add_node("build_system_prompt", build_system_prompt)
     graph.add_node("generate_adversarial_prompt", generate_adversarial_prompt)

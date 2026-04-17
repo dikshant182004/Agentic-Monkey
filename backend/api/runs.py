@@ -1,15 +1,16 @@
 """Chaos run lifecycle API routes including SSE and live state polling.
 
-LangGraph 1.x fix:
-- get_live_state uses graph.aget_state(config) instead of checkpointer.aget(config)
-  and converts snapshot.values to a plain dict before returning.
-  This prevents the 'dict_values' object has no attribute 'get' crash when the
-  frontend or SSE consumer reads the response.
+FIX: asyncio.create_task() swallows exceptions silently. We now attach a
+done-callback that writes a "failed" status to the run DB record when the
+orchestrator graph crashes, so SSE consumers can detect and surface the error
+instead of polling forever.
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+from datetime import datetime, timezone
 from uuid import uuid4
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -21,11 +22,51 @@ from backend.chaos.orchestrator import run_chaos_experiment, stream_run_events
 from backend.chaos.graphs import build_orchestrator_graph
 from backend.db import crud
 from backend.db.models import Run
-from backend.db.session import get_db
+from backend.db.session import get_db, AsyncSessionFactory
 from backend.memory.redis_checkpointer import get_redis_checkpointer, run_thread_id
 from backend.schemas.runs import RunCreateRequest
 
 router = APIRouter(prefix="/runs", tags=["runs"])
+logger = logging.getLogger(__name__)
+
+
+def _make_task_error_callback(run_id: str):
+    """Return a done-callback that marks the run as failed if the task raised."""
+    def _callback(task: asyncio.Task) -> None:
+        exc = task.exception() if not task.cancelled() else None
+        if exc is not None:
+            logger.exception(
+                "Orchestrator task for run %s raised an unhandled exception",
+                run_id,
+                exc_info=exc,
+            )
+            # Best-effort DB update — schedule as a new task so we don't block
+            asyncio.create_task(_mark_run_failed(run_id, str(exc)))
+    return _callback
+
+
+async def _mark_run_failed(run_id: str, error: str) -> None:
+    """Write failed status to the run record so SSE consumers see it."""
+    try:
+        async with AsyncSessionFactory() as session:
+            await crud.update_run_final(
+                session=session,
+                run_id=run_id,
+                status="failed",
+                blast_radius="unknown",
+                monkeys_selected=[],
+                overall_srq=0.0,
+                overall_hrt=0.0,
+                overall_safety=0.0,
+                afp_count=0,
+                ethical_drift_score=0.0,
+                agentic_resilience_score=0.0,
+                estimated_cost_usd=0.0,
+                finished_at=datetime.now(timezone.utc),
+            )
+            await session.commit()
+    except Exception:
+        logger.exception("Failed to mark run %s as failed in DB", run_id)
 
 
 @router.post("")
@@ -58,8 +99,9 @@ async def create_run(
     db.add(run)
     await db.commit()
 
+    run_id = str(run.id)
     initial_state = {
-        "run_id": str(run.id),
+        "run_id": run_id,
         "agent_id": str(agent.id),
         "user_id": user.user_id,
         "agent_config": agent.config,
@@ -95,11 +137,15 @@ async def create_run(
         "current_notes": "",
         "current_afp_description": "",
         "current_openpipe_request_id": "",
-        "current_interaction_id": str(run.id),
+        "current_interaction_id": str(uuid4()),
         "current_token_cost_usd": 0.0,
     }
-    asyncio.create_task(run_chaos_experiment(initial_state))
-    return {"run_id": str(run.id), "status": "running"}
+
+    # FIX: attach error callback so crashes are logged and surfaced in DB/SSE
+    task = asyncio.create_task(run_chaos_experiment(initial_state))
+    task.add_done_callback(_make_task_error_callback(run_id))
+
+    return {"run_id": run_id, "status": "running"}
 
 
 @router.get("")
@@ -147,18 +193,12 @@ async def get_live_state(
     user: CurrentUser = Depends(get_current_user),
     checkpointer=Depends(get_redis_checkpointer),
 ) -> dict:
-    """Return current OrchestratorState snapshot from checkpointer backend.
-
-    LangGraph 1.x fix: use graph.aget_state() and cast .values to dict.
-    snapshot.values in newer LangGraph versions is a channel-values view, not
-    a plain dict, so calling dict() on it is required before returning JSON.
-    """
+    """Return current OrchestratorState snapshot from checkpointer backend."""
     graph = build_orchestrator_graph(checkpointer)
     config = run_thread_id(run_id)
     snapshot = await graph.aget_state(config)
     if snapshot is None or not snapshot.values:
         raise HTTPException(status_code=404, detail="No live state found - run may be complete")
-    # Cast to plain dict for JSON serialisation and safe .get() access
     return dict(snapshot.values)
 
 

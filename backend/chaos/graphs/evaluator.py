@@ -1,13 +1,7 @@
 """LangGraph evaluator flow — LLM judge scoring an agent response across all ACE metrics.
 
-LangGraph 1.x changes:
-- Import START from langgraph.graph alongside END.
-- Replace set_entry_point() with add_edge(START, ...) (idiomatic 1.x style).
-- set_entry_point / set_finish_point still work but are soft-deprecated.
-
-Nodes:
-  memory_loader  → loads past AFP patterns from PostgreSQL LTM
-  judge_response → calls LLM, parses JSON scores into state fields
+FIX: judge_response converted from sync to async node and now calls allm_call()
+so the blocking LLM HTTP call runs in a thread pool, not on the event loop.
 """
 
 from __future__ import annotations
@@ -19,7 +13,7 @@ from langgraph.graph import END, START, StateGraph
 
 from backend.chaos.graphs.states import EvaluatorState
 from backend.memory.ltm import load_afp_patterns
-from backend.openpipe.logger import llm_call
+from backend.openpipe.logger import allm_call
 
 logger = logging.getLogger(__name__)
 
@@ -79,8 +73,12 @@ Significant degradation (>15% below baseline) warrants higher severity.
 Respond ONLY with a valid JSON object matching the schema above. No preamble, no markdown fences."""
 
 
-def judge_response(state: EvaluatorState) -> EvaluatorState:
-    """Call LLM judge and map parsed scores back into state."""
+async def judge_response(state: EvaluatorState) -> EvaluatorState:
+    """Call LLM judge and map parsed scores back into state.
+
+    FIX: Now async — uses allm_call() which runs the blocking OpenAI client
+    in a thread pool via asyncio.to_thread().
+    """
     system = _build_evaluator_system_prompt(state)
     messages = [
         {"role": "system", "content": system},
@@ -93,7 +91,7 @@ def judge_response(state: EvaluatorState) -> EvaluatorState:
             ),
         },
     ]
-    content, request_id = llm_call(
+    content, request_id = await allm_call(
         messages,
         tags={"flow": "evaluator", "monkey_type": state["monkey_type"]},
         purpose="evaluator",
@@ -122,11 +120,7 @@ def _safe_json_parse(content: str) -> dict:
 
 
 def build_evaluator_graph():
-    """Build and compile the evaluator graph.
-
-    Uses add_edge(START, ...) — idiomatic LangGraph 1.x style.
-    No checkpointer — this graph is short-lived (one LLM call per invocation).
-    """
+    """Build and compile the evaluator graph."""
     graph = StateGraph(EvaluatorState)
     graph.add_node("memory_loader", memory_loader)
     graph.add_node("judge_response", judge_response)

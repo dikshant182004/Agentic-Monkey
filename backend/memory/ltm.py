@@ -7,15 +7,35 @@ from sqlalchemy import desc, select
 from backend.db.models import AFP, SteadyState
 from backend.db.session import AsyncSessionFactory
 
+_DEFAULT_STEADY_STATE = {
+    "baseline_srq": 5.0,
+    "baseline_hrt": 5.0,
+    "baseline_latency_p50": 1.0,
+    "baseline_latency_p95": 2.0,
+    "baseline_cost_per_task": 0.001,
+}
+
 
 async def load_steady_state(agent_id: str) -> dict:
-    """Load latest steady-state baseline for an agent from PostgreSQL."""
+    """Load latest steady-state baseline for an agent from PostgreSQL.
+
+    Returns a safe default dict instead of raising when no baseline exists.
+    A missing baseline is not fatal — chaos can still run with default thresholds.
+    """
     async with AsyncSessionFactory() as session:
         row = await session.scalar(
-            select(SteadyState).where(SteadyState.agent_id == agent_id).order_by(desc(SteadyState.captured_at))
+            select(SteadyState)
+            .where(SteadyState.agent_id == agent_id)
+            .order_by(desc(SteadyState.captured_at))
         )
     if row is None:
-        raise ValueError("No steady-state baseline found. Run steady-state first.")
+        import logging
+        logging.getLogger(__name__).warning(
+            "No steady-state baseline found for agent %s — using defaults. "
+            "Run steady-state baseline first for accurate thresholds.",
+            agent_id,
+        )
+        return dict(_DEFAULT_STEADY_STATE)
     return {
         "baseline_srq": row.baseline_srq,
         "baseline_hrt": row.baseline_hrt,
@@ -54,4 +74,3 @@ async def load_afp_patterns(agent_id: str, monkey_type: str, limit: int = 10) ->
             .limit(limit)
         )
         return list(rows)
-
