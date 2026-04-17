@@ -1,4 +1,13 @@
-"""Thin orchestrator façade for API-facing run execution and SSE streaming."""
+"""Thin orchestrator façade for API-facing run execution and SSE streaming.
+
+LangGraph 1.x fixes applied:
+- snapshot.values returns a dict_values view in newer checkpointers; always cast
+  to dict() before calling .get() on it — this was the root cause of the
+  AttributeError: 'dict_values' object has no attribute 'get' crash.
+- Use graph.aget_state(config) instead of checkpointer.aget() directly; this
+  returns a proper StateSnapshot whose .values is already a plain dict in 1.x,
+  but we still defensively cast it.
+"""
 
 from __future__ import annotations
 
@@ -30,16 +39,28 @@ async def run_chaos_experiment(initial_state: dict) -> str:
 
 
 async def stream_run_events(run_id: str):
-    """Yield periodic SSE events by polling checkpoint state and emitting heartbeat."""
+    """Yield periodic SSE events by polling checkpoint state and emitting heartbeat.
+
+    Fix: snapshot.values in LangGraph 1.x may be a dict_values object from the
+    channel manager. Always convert to a plain dict before any .get() calls.
+    We use graph.aget_state() which is the blessed public API for reading state.
+    """
     checkpointer = await get_redis_checkpointer()
+    graph = build_orchestrator_graph(checkpointer)
+    config = run_thread_id(run_id)
     last_heartbeat = 0.0
+
     while True:
-        snapshot = await checkpointer.aget(run_thread_id(run_id))
+        snapshot = await graph.aget_state(config)
         now = asyncio.get_running_loop().time()
-        if snapshot is None:
+
+        if snapshot is None or not snapshot.values:
             yield _sse_event("complete", {"run_id": run_id, "status": "complete"})
             break
-        state = snapshot.values
+
+        # ── FIX: cast to plain dict so .get() always works ──────────────────
+        state: dict = dict(snapshot.values)
+
         if state.get("hitl_pending"):
             yield _sse_event(
                 "hitl_required",
@@ -68,11 +89,16 @@ async def stream_run_events(run_id: str):
                     "status": state.get("status", "running"),
                 },
             )
+
         if now - last_heartbeat >= 15:
             yield _sse_event("heartbeat", {"ts": datetime.now(timezone.utc).isoformat()})
             last_heartbeat = now
-        if state.get("status") == "complete":
-            yield _sse_event("complete", {"run_id": run_id, "summary": state.get("final_report", {})})
-            break
-        await asyncio.sleep(2)
 
+        if state.get("status") == "complete":
+            yield _sse_event(
+                "complete",
+                {"run_id": run_id, "summary": state.get("final_report", {})},
+            )
+            break
+
+        await asyncio.sleep(2)

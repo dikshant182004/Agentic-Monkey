@@ -16,5 +16,5 @@ async def chat(payload: dict) -> dict:
     """Accept arbitrary JSON and echo the `message` field as response."""
     message = payload.get("message", "")
     session_id = payload.get("session_id", "")
-    return {"response": f"[ECHO session_id={session_id}] {message}"}
+    return {"response": f"ECHO session_id={session_id}] {message}"}
 

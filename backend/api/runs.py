@@ -1,4 +1,11 @@
-"""Chaos run lifecycle API routes including SSE and live state polling."""
+"""Chaos run lifecycle API routes including SSE and live state polling.
+
+LangGraph 1.x fix:
+- get_live_state uses graph.aget_state(config) instead of checkpointer.aget(config)
+  and converts snapshot.values to a plain dict before returning.
+  This prevents the 'dict_values' object has no attribute 'get' crash when the
+  frontend or SSE consumer reads the response.
+"""
 
 from __future__ import annotations
 
@@ -11,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth.dependencies import CurrentUser, get_current_user
 from backend.chaos.orchestrator import run_chaos_experiment, stream_run_events
+from backend.chaos.graphs import build_orchestrator_graph
 from backend.db import crud
 from backend.db.models import Run
 from backend.db.session import get_db
@@ -21,11 +29,16 @@ router = APIRouter(prefix="/runs", tags=["runs"])
 
 
 @router.post("")
-async def create_run(payload: RunCreateRequest, user: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+async def create_run(
+    payload: RunCreateRequest,
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """Create run record and start orchestrator graph asynchronously."""
     agent = await crud.get_agent(db, user.user_id, payload.agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
+
     run = Run(
         id=uuid4(),
         agent_id=agent.id,
@@ -44,6 +57,7 @@ async def create_run(payload: RunCreateRequest, user: CurrentUser = Depends(get_
     )
     db.add(run)
     await db.commit()
+
     initial_state = {
         "run_id": str(run.id),
         "agent_id": str(agent.id),
@@ -89,14 +103,29 @@ async def create_run(payload: RunCreateRequest, user: CurrentUser = Depends(get_
 
 
 @router.get("")
-async def list_runs(user: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> list[dict]:
+async def list_runs(
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
     """List all runs for current user."""
     runs = await crud.list_runs(db, user.user_id)
-    return [{"id": str(item.id), "status": item.status, "blast_radius": item.blast_radius, "overall_srq": item.overall_srq} for item in runs]
+    return [
+        {
+            "id": str(item.id),
+            "status": item.status,
+            "blast_radius": item.blast_radius,
+            "overall_srq": item.overall_srq,
+        }
+        for item in runs
+    ]
 
 
 @router.get("/{run_id}")
-async def get_run(run_id: str, user: CurrentUser = Depends(get_current_user), db: AsyncSession = Depends(get_db)) -> dict:
+async def get_run(
+    run_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> dict:
     """Get one run aggregate record from PostgreSQL."""
     run = await crud.get_run(db, run_id, user.user_id)
     if run is None:
@@ -118,15 +147,25 @@ async def get_live_state(
     user: CurrentUser = Depends(get_current_user),
     checkpointer=Depends(get_redis_checkpointer),
 ) -> dict:
-    """Return current OrchestratorState snapshot from checkpointer backend."""
-    snapshot = await checkpointer.aget(run_thread_id(run_id))
-    if snapshot is None:
+    """Return current OrchestratorState snapshot from checkpointer backend.
+
+    LangGraph 1.x fix: use graph.aget_state() and cast .values to dict.
+    snapshot.values in newer LangGraph versions is a channel-values view, not
+    a plain dict, so calling dict() on it is required before returning JSON.
+    """
+    graph = build_orchestrator_graph(checkpointer)
+    config = run_thread_id(run_id)
+    snapshot = await graph.aget_state(config)
+    if snapshot is None or not snapshot.values:
         raise HTTPException(status_code=404, detail="No live state found - run may be complete")
-    return snapshot.values
+    # Cast to plain dict for JSON serialisation and safe .get() access
+    return dict(snapshot.values)
 
 
 @router.get("/{run_id}/stream")
-async def stream_run(run_id: str, user: CurrentUser = Depends(get_current_user)) -> StreamingResponse:
+async def stream_run(
+    run_id: str,
+    user: CurrentUser = Depends(get_current_user),
+) -> StreamingResponse:
     """Stream run events over Server-Sent Events with heartbeat support."""
     return StreamingResponse(stream_run_events(run_id), media_type="text/event-stream")
-

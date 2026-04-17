@@ -1,17 +1,19 @@
-"""LangGraph scenario generator flow for adversarial prompt expansion."""
+"""LangGraph scenario generator flow for adversarial prompt expansion.
+
+LangGraph 1.x: uses add_edge(START, ...) instead of set_entry_point().
+"""
 
 from __future__ import annotations
 
 import json
 
-from langgraph.graph import END, StateGraph
+from langgraph.graph import END, START, StateGraph
 
 from backend.chaos.graphs.states import ScenarioGenState
 from backend.openpipe.logger import llm_call
 
 
 def _safe_json_parse(content: str) -> dict:
-    """Parse JSON safely and return a deterministic fallback on parse errors."""
     try:
         parsed = json.loads(content)
         if isinstance(parsed, dict):
@@ -73,15 +75,17 @@ def generate_adversarial_prompt(state: ScenarioGenState) -> ScenarioGenState:
 
 
 def build_scenario_generator_graph():
-    """Build and compile scenario generator graph once at module load."""
+    """Build and compile scenario generator graph.
+
+    Uses add_edge(START, ...) — idiomatic LangGraph 1.x style.
+    """
     graph = StateGraph(ScenarioGenState)
     graph.add_node("build_system_prompt", build_system_prompt)
     graph.add_node("generate_adversarial_prompt", generate_adversarial_prompt)
-    graph.set_entry_point("build_system_prompt")
+    graph.add_edge(START, "build_system_prompt")
     graph.add_edge("build_system_prompt", "generate_adversarial_prompt")
     graph.add_edge("generate_adversarial_prompt", END)
     return graph.compile()
 
 
 scenario_generator_graph = build_scenario_generator_graph()
-
