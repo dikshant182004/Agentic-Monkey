@@ -19,7 +19,7 @@ class Settings(BaseSettings):
 
     cerebras_api_key: str = Field(default="", alias="CEREBRAS_API_KEY")
     cerebras_base_url: str = Field(default="https://api.cerebras.ai/v1", alias="CEREBRAS_BASE_URL")
-    cerebras_model: str = Field(default="llama3.1-70b", alias="CEREBRAS_MODEL")
+    cerebras_model: str = Field(default="llama3.1-8b", alias="CEREBRAS_MODEL")
 
     openpipe_api_key: str = Field(default="", alias="OPENPIPE_API_KEY")
     langchain_tracing_v2: bool = Field(default=True, alias="LANGCHAIN_TRACING_V2")

@@ -1,9 +1,20 @@
 """Chaos run lifecycle API routes including SSE and live state polling.
 
-FIX: asyncio.create_task() swallows exceptions silently. We now attach a
-done-callback that writes a "failed" status to the run DB record when the
-orchestrator graph crashes, so SSE consumers can detect and surface the error
-instead of polling forever.
+Fixes applied
+─────────────
+BUG 8  _mark_run_failed previously hard-coded blast_radius="unknown" and
+       monkeys_selected=[] in the update_run_final call, clobbering the
+       original values persisted when the Run row was created. This made
+       the dashboard show "unknown" blast radius for failed runs.
+
+       The fix: _mark_run_failed now queries the Run row first and passes
+       the original field values back to update_run_final, only overwriting
+       status and finished_at.
+
+       NOTE: _mark_run_failed lives in orchestrator.py in the fixed version
+       (where it has access to the full run row). The version here in runs.py
+       delegates to the orchestrator module helper so there is a single
+       implementation.
 """
 
 from __future__ import annotations
@@ -18,7 +29,7 @@ from fastapi.responses import StreamingResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.auth.dependencies import CurrentUser, get_current_user
-from backend.chaos.orchestrator import run_chaos_experiment, stream_run_events
+from backend.chaos.orchestrator import _mark_run_failed, run_chaos_experiment, stream_run_events
 from backend.chaos.graphs import build_orchestrator_graph
 from backend.db import crud
 from backend.db.models import Run
@@ -31,7 +42,11 @@ logger = logging.getLogger(__name__)
 
 
 def _make_task_error_callback(run_id: str):
-    """Return a done-callback that marks the run as failed if the task raised."""
+    """Return a done-callback that marks the run as failed if the task raised.
+
+    BUG 8 FIX: Delegates to orchestrator._mark_run_failed which preserves the
+    original blast_radius / monkeys_selected values fetched from the DB.
+    """
     def _callback(task: asyncio.Task) -> None:
         exc = task.exception() if not task.cancelled() else None
         if exc is not None:
@@ -40,33 +55,8 @@ def _make_task_error_callback(run_id: str):
                 run_id,
                 exc_info=exc,
             )
-            # Best-effort DB update — schedule as a new task so we don't block
             asyncio.create_task(_mark_run_failed(run_id, str(exc)))
     return _callback
-
-
-async def _mark_run_failed(run_id: str, error: str) -> None:
-    """Write failed status to the run record so SSE consumers see it."""
-    try:
-        async with AsyncSessionFactory() as session:
-            await crud.update_run_final(
-                session=session,
-                run_id=run_id,
-                status="failed",
-                blast_radius="unknown",
-                monkeys_selected=[],
-                overall_srq=0.0,
-                overall_hrt=0.0,
-                overall_safety=0.0,
-                afp_count=0,
-                ethical_drift_score=0.0,
-                agentic_resilience_score=0.0,
-                estimated_cost_usd=0.0,
-                finished_at=datetime.now(timezone.utc),
-            )
-            await session.commit()
-    except Exception:
-        logger.exception("Failed to mark run %s as failed in DB", run_id)
 
 
 @router.post("")
@@ -141,7 +131,6 @@ async def create_run(
         "current_token_cost_usd": 0.0,
     }
 
-    # FIX: attach error callback so crashes are logged and surfaced in DB/SSE
     task = asyncio.create_task(run_chaos_experiment(initial_state))
     task.add_done_callback(_make_task_error_callback(run_id))
 

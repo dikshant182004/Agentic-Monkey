@@ -4,6 +4,14 @@ All functions accept an AsyncSession and are designed to be called from:
   - FastAPI route handlers (via get_db() dependency)
   - Orchestrator graph nodes (via AsyncSessionFactory() context manager)
 
+Fixes applied
+─────────────
+BUG 1/14  get_run() requires a user_id scope (correct for API routes). Added
+          get_run_unscoped() for internal callers (orchestrator stream poller)
+          that need to look up a Run by id only, without a user filter.
+          The original code passed user_id=None which produced SQL
+          WHERE user_id = NULL — a condition that never matches.
+
 Important:
   - Never raise on "not found" — return None instead (callers handle 404)
   - commit() is the caller's responsibility for session-scoped operations
@@ -102,10 +110,22 @@ async def list_runs(session: AsyncSession, user_id: str) -> list[Run]:
 
 
 async def get_run(session: AsyncSession, run_id: str, user_id: str) -> Run | None:
-    """Fetch one run by id scoped to user."""
+    """Fetch one run by id scoped to user. For API routes — always requires user_id."""
     return await session.scalar(
         select(Run).where(Run.id == run_id, Run.user_id == user_id)
     )
+
+
+async def get_run_unscoped(session: AsyncSession, run_id: str) -> Run | None:
+    """Fetch one run by id WITHOUT a user scope check.
+
+    BUG 1/14 FIX: Internal callers (e.g. the SSE stream poller in
+    orchestrator.py) do not have a user_id available. The original code
+    passed user_id=None to get_run() which produced SQL WHERE user_id = NULL
+    — a condition that never matches. This function is the correct internal
+    alternative.
+    """
+    return await session.scalar(select(Run).where(Run.id == run_id))
 
 
 async def update_run_final(
@@ -123,13 +143,7 @@ async def update_run_final(
     estimated_cost_usd: float,
     finished_at: datetime,
 ) -> None:
-    """Update terminal run record metrics in PostgreSQL.
-
-    Called by the finalize_run orchestrator node.
-    afp_count is passed in from the report builder (computed from turn_scores STM)
-    rather than re-queried from the DB — avoids a round trip and ensures consistency
-    with the in-memory run view.
-    """
+    """Update terminal run record metrics in PostgreSQL."""
     run = await session.scalar(select(Run).where(Run.id == run_id))
     if run is None:
         return
@@ -234,11 +248,7 @@ async def create_afp(
 async def load_afp_patterns(
     session: AsyncSession, agent_id: str, monkey_type: str, limit: int = 10
 ) -> list[str]:
-    """Load recent AFP descriptions for one agent and monkey type (DB-layer version).
-
-    The memory/ltm.py module provides the same function but manages its own session.
-    This version is useful when you already have an open session.
-    """
+    """Load recent AFP descriptions for one agent and monkey type (DB-layer version)."""
     rows = await session.scalars(
         select(AFP.description)
         .where(AFP.agent_id == agent_id, AFP.monkey_type == monkey_type)
