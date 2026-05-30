@@ -1,4 +1,4 @@
-"""Schemas for chaos run creation and response payloads."""
+"""Schemas for chaos run creation and response payloads — v2."""
 
 from pydantic import BaseModel, Field
 
@@ -11,6 +11,10 @@ class RunCreateRequest(BaseModel):
     intensity: int = Field(default=3, ge=1, le=5)
     blast_radius: str = Field(default="staging")
     hypothesis: str = Field(default="")
+    auto_plan: bool = Field(
+        default=False,
+        description="If true and monkeys_selected is empty, derive experiment config from A2A card automatically.",
+    )
 
 
 class RunResponse(BaseModel):
@@ -22,4 +26,3 @@ class RunResponse(BaseModel):
     overall_srq: float = 0.0
     overall_hrt: float = 0.0
     overall_safety: float = 0.0
-

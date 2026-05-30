@@ -26,7 +26,7 @@ from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from backend.api import agents, finetune, hitl, runs, steady_state
+from backend.api import agents, hitl, runs, steady_state
 from backend.config import settings
 from backend.db.session import AsyncSessionFactory
 from backend.memory.redis_checkpointer import get_redis_checkpointer
@@ -75,8 +75,6 @@ app.include_router(agents.router)
 app.include_router(steady_state.router)
 app.include_router(runs.router)
 app.include_router(hitl.router)
-app.include_router(finetune.router)
-
 
 @app.get("/health")
 async def health() -> tuple[dict, int] | dict:

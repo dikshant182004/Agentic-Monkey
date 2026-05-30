@@ -53,32 +53,3 @@ def reject_turn(run_id: str) -> dict:
     response = requests.post(f"{BACKEND_URL}/runs/{run_id}/reject", headers=get_headers(), timeout=30)
     response.raise_for_status()
     return response.json()
-
-
-def finetune_stats() -> dict:
-    """Get OpenPipe fine-tune dataset stats."""
-    response = requests.get(f"{BACKEND_URL}/finetune/stats", headers=get_headers(), timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def finetune_trigger() -> dict:
-    """Trigger OpenPipe fine-tune job."""
-    response = requests.post(f"{BACKEND_URL}/finetune/trigger", headers=get_headers(), timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def finetune_status(job_id: str) -> dict:
-    """Poll OpenPipe fine-tune status."""
-    response = requests.get(f"{BACKEND_URL}/finetune/status/{job_id}", headers=get_headers(), timeout=30)
-    response.raise_for_status()
-    return response.json()
-
-
-def finetune_activate(model_id: str) -> dict:
-    """Activate a specific fine-tuned model."""
-    response = requests.post(f"{BACKEND_URL}/finetune/activate/{model_id}", headers=get_headers(), timeout=30)
-    response.raise_for_status()
-    return response.json()
-

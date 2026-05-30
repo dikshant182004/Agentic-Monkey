@@ -26,6 +26,5 @@ redis==5.2.1
 # metadata={"prompt_id":...}. Pin to 4.x until backend/openpipe/logger.py
 # is updated to the new API. Upgrading past 4.x without updating logger.py
 # will silently drop all OpenPipe request logging.
-openpipe==4.42.0
 streamlit
 plotly==6.0.1

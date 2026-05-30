@@ -1,61 +1,95 @@
-"""TypedDict graph state schemas used by ChaosAgent LangGraph flows.
+"""
+ChaosAgent Graph State Schemas — updated for v2.
 
-Every field that is accessed in any graph node MUST be declared here.
-Nodes return {**state, ...updated_keys...} — undeclared keys are dropped
-by LangGraph's state reducer.
+Changes from v1:
+  OrchestratorState:
+    + refinement_budget      int — remaining refinement calls this run
+    + current_attack_angle   str — attack angle used this turn (from generator)
+    + current_seed_id        str — seed ID used this turn (for logging)
+    + auto_planned           bool — whether experiment was auto-planned from A2A card
+
+  ScenarioGenState:
+    + selected_seed          dict | None — seed selected for this turn
+    + agent_config           dict — agent config passed through for Layer 2 context
+    + turn_scores            list[dict] — turn history for Layer 3 context
+    + current_turn           int — current turn number for seed cycling
+    + current_response       str — agent response (for refinement Layer 4)
+    + current_safety_score   float — current safety score (for refinement gate)
+    + refinement_budget      int — remaining budget (for refinement gate)
+    + is_refined             bool — whether this turn was already refined
+    + attack_angle           str — output: angle used
 """
 
 from typing import Literal, Optional, TypedDict
 
 
 class ScenarioGenState(TypedDict):
-    """STM for one scenario_generator graph invocation (short-lived)."""
+    """State for one scenario_generator graph invocation."""
 
-    seed_scenario: str
+    # Inputs
+    seed_scenario: str           # legacy field, kept for compatibility
     agent_capabilities: list[str]
     agent_tools: list[str]
     monkey_type: str
-    intensity: int              # 1–5
+    intensity: int               # 1-5
 
-    # Set by nodes:
+    # NEW: full agent config for Layer 2 context
+    agent_config: dict
+
+    # NEW: selected seed dict from seed library
+    selected_seed: Optional[dict]
+
+    # NEW: turn history for Layer 3 context
+    turn_scores: list[dict]
+    current_turn: int
+
+    # NEW: refinement gate inputs
+    current_response: str        # agent response from previous attempt
+    current_safety_score: float  # score from evaluator (gate: only refine if > 6)
+    refinement_budget: int       # decremented by orchestrator when refinement fires
+    is_refined: bool             # True after first refinement — prevents double-refine
+
+    # Outputs set by generator nodes
     system_prompt: str
     elaborated_prompt: str
     expected_behavior: str
     failure_hypothesis: str
+    attack_angle: str            # NEW: social engineering angle used
     openpipe_request_id: str
 
 
 class FailureInjectorState(TypedDict):
-    """STM for one failure_injector graph invocation (short-lived, deterministic)."""
+    """State for one failure_injector graph invocation (short-lived, deterministic)."""
 
     tool_response: dict
     failure_mode: str
     tool_name: str
 
-    # Output:
+    # Output
     mutated_response: dict | str
 
 
 class EvaluatorState(TypedDict):
-    """STM for one evaluator graph invocation.
+    """State for one evaluator graph invocation."""
 
-    NOTE: agent_id is required by the memory_loader node so it can scope
-    AFP pattern queries to the specific agent under test (not all agents).
-    The original implementation was missing this field and queried across
-    all agents — that has been corrected.
-    """
-
-    agent_id: str               # ← required for LTM scoped AFP queries
+    agent_id: str
     prompt: str
     agent_response: str
     monkey_type: str
     baseline_srq: float
     baseline_hrt: float
 
-    # LTM context loaded by memory_loader node (PostgreSQL → STM):
+    # NEW: technique context for more precise evaluation
+    atlas_id: str                # MITRE ATLAS technique used
+    owasp_category: str          # OWASP ASI category
+    attack_surface: str          # what was targeted
+    failure_hypothesis: str      # what failure we were testing for
+    attack_angle: str            # social engineering angle used
+
+    # LTM context loaded by memory_loader
     past_afp_patterns: list[str]
 
-    # Outputs set by judge_response node:
+    # Outputs
     srq_score: float
     hrt_score: float
     safety_score: float
@@ -70,51 +104,47 @@ class EvaluatorState(TypedDict):
 
 
 class OrchestratorState(TypedDict):
-    """STM for the main orchestrator graph — persisted in Redis for the full run.
-
-    This is the single source of truth for a live chaos experiment.
-    Redis checkpointer snapshots this after every node boundary.
-
-    STM vs LTM:
-    - All fields here are STM (in-graph working memory for one run)
-    - LTM lives in PostgreSQL: AFP table, SteadyState table, Interaction table
-    - steady_state is loaded from LTM at run start and lives in STM from that point on
-    """
+    """Main orchestrator state — persisted in Redis for the full run."""
 
     # ── Run identity ──────────────────────────────────────────────────────────
     run_id: str
     agent_id: str
     user_id: str
-    agent_config: dict              # AgentConfig.to_dict() — serialised dataclass
+    agent_config: dict
 
-    # ── LTM snapshot (loaded once at run start via load_context node) ─────────
-    steady_state: dict              # SteadyState baseline metrics dict
+    # ── LTM snapshot ──────────────────────────────────────────────────────────
+    steady_state: dict
 
     # ── Experiment config ─────────────────────────────────────────────────────
-    blast_radius: str               # "dev" | "staging" | "canary"
+    blast_radius: str
     monkeys_selected: list[str]
-    intensity: int                  # 1–5
+    intensity: int
+    auto_planned: bool           # NEW: True if auto-planned from A2A card
 
-    # ── Run-time accumulation (updated per turn) ──────────────────────────────
+    # ── Run-time accumulation ─────────────────────────────────────────────────
     current_turn: int
     total_turns_planned: int
-    turn_scores: list[dict]         # one dict per completed turn
-    afp_discoveries: list[dict]     # AFPs found this run (for in-run reference)
+    turn_scores: list[dict]
+    afp_discoveries: list[dict]
     estimated_cost_usd: float
     consecutive_errors: int
-    running_srq: float              # rolling mean SRQ across completed turns
+    running_srq: float
+
+    # ── Refinement budget ────────────────────────────────────────────────────
+    refinement_budget: int       # NEW: decremented each time refinement fires
+    refinement_used: int         # NEW: total refinements used this run
 
     # ── HITL fields ───────────────────────────────────────────────────────────
     hitl_pending: bool
     hitl_interaction_id: Optional[str]
     hitl_decision: Optional[Literal["approved", "rejected"]]
-    hitl_required: bool             # ← True when this turn demanded HITL (for DB logging)
+    hitl_required: bool
 
     # ── Terminal status ───────────────────────────────────────────────────────
     status: Literal["running", "paused_hitl", "paused_blast", "complete", "failed"]
     final_report: Optional[dict]
 
-    # ── Per-turn staging fields (populated during a turn, consumed by log_and_continue) ──
+    # ── Per-turn staging fields ───────────────────────────────────────────────
     current_monkey: str
     current_prompt: str
     current_response: str
@@ -130,5 +160,12 @@ class OrchestratorState(TypedDict):
     current_notes: str
     current_afp_description: str
     current_openpipe_request_id: str
-    current_interaction_id: str     # UUID string — generated fresh each turn
+    current_interaction_id: str
     current_token_cost_usd: float
+
+    # NEW: seed/technique metadata for logging
+    current_attack_angle: str    # social engineering angle used this turn
+    current_seed_id: str         # seed ID for reproducibility
+    current_atlas_id: str        # MITRE ATLAS technique
+    current_owasp_category: str  # OWASP ASI category
+    current_failure_hypothesis: str  # what we were testing for

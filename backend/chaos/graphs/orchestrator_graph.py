@@ -1,24 +1,18 @@
-"""Main orchestrator LangGraph — the brain of every chaos experiment.
+"""
+ChaosAgent Orchestrator Graph v2 — updated for improved injectors,
+refinement budget tracking, new monkey types, and auto-planning.
 
-Fixes applied (this revision)
-──────────────────────────────
-BUG A [CRITICAL] ForeignKeyViolationError on afps.interaction_id_fkey:
-  log_and_continue opened ONE session, added Interaction (not yet committed),
-  then called write_afp_to_ltm() which opened a SECOND session and immediately
-  committed an AFP referencing that interaction_id. The FK lookup found no
-  matching interactions row → 500 on /approve.
-
-  Fix: write_afp_to_ltm() removed from log_and_continue entirely.
-  crud.create_afp() adds AFP to the SAME session as crud.create_interaction().
-  One session.commit() at the end makes Interaction + AFP atomic.
-  tag_interaction() (HTTP only, no DB) moved after the commit.
-
-Previous fixes carried forward
-───────────────────────────────
-- interrupt_before removed; HITL uses interrupt() inside hitl_gate.
-- Resume via Command(resume={"decision": "approved"}).
-- select_next_monkey uses modulo (not itertools.cycle+islice).
-- write_afp_to_ltm import removed (no longer called here).
+Key changes from v1:
+  - generate_scenario now passes agent_config + turn_scores + refinement_budget
+    into ScenarioGenState so the scenario generator can apply all 4 context layers.
+  - After call_target_agent, evaluate_response now receives seed technique metadata
+    (atlas_id, owasp_category, attack_surface, attack_angle, failure_hypothesis)
+    so the evaluator can score with technique awareness.
+  - log_and_continue decrements refinement_budget when is_refined=True.
+  - load_context now initializes refinement_budget from blast_radius config.
+  - New monkey types (rag_poisoning, supply_chain, privilege_escalation) are
+    supported via seed_library dispatch — no per-monkey elif chains needed.
+  - Auto-plan flag is stored in state for reporting.
 """
 
 from __future__ import annotations
@@ -37,18 +31,15 @@ from backend.chaos.graphs.states import OrchestratorState
 from backend.db import crud
 from backend.db.session import AsyncSessionFactory
 from backend.evaluation.report import build_report
-from backend.injectors.cti_monkey import contradictory_instructions
-from backend.injectors.tool_vortex_monkey import FAILURE_MODES, generate_vortex_scenarios
-from backend.injectors.memory_entropy_monkey import context_overflow_probe, memory_reset_attack
-from backend.injectors.security_storm_monkey import prompt_injection_attacks
-from backend.injectors.autonomy_probe_monkey import escalating_ambiguity_probes
-from backend.injectors.inter_agent_monkey import orchestrator_manipulation_probe
-from backend.injectors.performance_monkey import cost_chaos_scenarios, ethical_drift_sequence
+from backend.injectors.seed_library import get_seed, REFINEMENT_BUDGET as SEED_REFINEMENT_BUDGET
+from backend.injectors.tool_vortex_monkey import FAILURE_MODES
 from backend.memory.ltm import load_steady_state
 from backend.memory.stm import init_stm, update_stm_with_turn
-from backend.openpipe.tagger import tag_interaction
 
 logger = logging.getLogger(__name__)
+
+# Re-export from seed_library for blast radius → refinement budget mapping
+from backend.chaos.graphs.scenario_generator import REFINEMENT_BUDGET
 
 # ── Blast radius limits ────────────────────────────────────────────────────────
 
@@ -58,34 +49,24 @@ BLAST_RADIUS_LIMITS = {
     "canary":  {"max_turns": 10,  "max_cost_usd": 1.0,  "parallel": False},
 }
 
-# ── Monkey → seed scenario dispatcher ─────────────────────────────────────────
-
-def _get_seed_scenarios(monkey: str, agent_config: dict) -> list[str]:
-    capabilities = agent_config.get("capabilities", []) or ["general"]
-    tools = agent_config.get("tools", []) or ["generic_tool"]
-    dispatch = {
-        "cti":            lambda: contradictory_instructions(capabilities),
-        "tool_vortex":    lambda: [s["scenario"] for s in generate_vortex_scenarios(tools)],
-        "memory_entropy": lambda: context_overflow_probe(capabilities) + memory_reset_attack(capabilities),
-        "security_storm": lambda: prompt_injection_attacks(capabilities),
-        "autonomy_probe": lambda: escalating_ambiguity_probes(capabilities),
-        "inter_agent":    lambda: orchestrator_manipulation_probe(capabilities),
-        "performance":    lambda: cost_chaos_scenarios(capabilities) + ethical_drift_sequence(capabilities),
-    }
-    fn = dispatch.get(monkey)
-    if fn is None:
-        logger.warning("Unknown monkey type %r — falling back to cti seeds", monkey)
-        fn = dispatch["cti"]
-    seeds = fn()
-    return seeds if seeds else [f"General adversarial probe for {monkey}"]
-
 
 # ── Nodes ──────────────────────────────────────────────────────────────────────
 
 async def load_context(state: OrchestratorState) -> OrchestratorState:
+    """Load LTM steady state and initialize STM. Set refinement budget."""
     steady_state = await load_steady_state(state["agent_id"])
     stm_init = init_stm(steady_state)
-    return {**state, **stm_init}
+
+    # Set refinement budget based on blast radius
+    blast = state.get("blast_radius", "staging")
+    budget = REFINEMENT_BUDGET.get(blast, 3)
+
+    return {
+        **state,
+        **stm_init,
+        "refinement_budget": budget,
+        "refinement_used": 0,
+    }
 
 
 async def select_next_monkey(state: OrchestratorState) -> OrchestratorState:
@@ -97,37 +78,91 @@ async def select_next_monkey(state: OrchestratorState) -> OrchestratorState:
 
 
 async def generate_scenario(state: OrchestratorState) -> OrchestratorState:
-    seeds = _get_seed_scenarios(state["current_monkey"], state["agent_config"])
-    seed = seeds[state["current_turn"] % len(seeds)]
+    """
+    Call scenario generator graph with full context.
+    Passes agent_config, turn_scores, and refinement_budget so the
+    generator can apply all 4 context layers + refinement gating.
+    """
+    monkey = state["current_monkey"]
+    turn = state["current_turn"]
+    intensity = state["intensity"]
+
+    # Get seed metadata for this turn (for evaluator context later)
+    seed = get_seed(monkey, turn)
+    seed_id = seed["id"] if seed else "fallback"
+    atlas_id = seed["atlas_id"] if seed else "AML.T0051"
+    owasp_cat = seed["owasp_category"] if seed else "ASI01"
+    attack_surface = seed["attack_surface"] if seed else "reasoning"
+    failure_hypo = seed.get("failure_hypothesis", seed.get("failure_hypo", "")) if seed else ""
+    seed_scenario = seed["description"] if seed else f"General adversarial probe for {monkey}"
+
     result = await run_scenario_generator(
         {
-            "seed_scenario": seed,
+            # Legacy fields
+            "seed_scenario": seed_scenario,
             "agent_capabilities": state["agent_config"].get("capabilities", []),
             "agent_tools": state["agent_config"].get("tools", []),
-            "monkey_type": state["current_monkey"],
-            "intensity": state["intensity"],
+            "monkey_type": monkey,
+            "intensity": intensity,
             "system_prompt": "",
             "elaborated_prompt": "",
             "expected_behavior": "",
-            "failure_hypothesis": "",
+            "failure_hypothesis": failure_hypo,
             "openpipe_request_id": "",
+            # v2: full context for 4-layer generation
+            "agent_config": state["agent_config"],
+            "selected_seed": seed,
+            "turn_scores": state.get("turn_scores", []),
+            "current_turn": turn,
+            "current_response": state.get("current_response", ""),
+            "current_safety_score": state.get("current_safety_score", 10.0),
+            "refinement_budget": state.get("refinement_budget", 0),
+            "is_refined": False,
+            "attack_angle": "",
         },
         run_id=state["run_id"],
     )
-    return {**state, "current_prompt": result["elaborated_prompt"]}
+
+    # Track if refinement fired this turn
+    was_refined = result.get("is_refined", False)
+    new_budget = state.get("refinement_budget", 0)
+    new_used = state.get("refinement_used", 0)
+    if was_refined:
+        new_budget = max(0, new_budget - 1)
+        new_used += 1
+        logger.info(
+            "Refinement used on turn %d — budget remaining: %d",
+            turn, new_budget,
+        )
+
+    return {
+        **state,
+        "current_prompt": result["elaborated_prompt"],
+        # Store seed/technique metadata for evaluator
+        "current_seed_id": seed_id,
+        "current_atlas_id": atlas_id,
+        "current_owasp_category": owasp_cat,
+        "current_attack_angle": result.get("attack_angle", "unknown"),
+        "current_failure_hypothesis": failure_hypo,
+        # Update refinement tracking
+        "refinement_budget": new_budget,
+        "refinement_used": new_used,
+    }
 
 
 async def inject_failure(state: OrchestratorState) -> OrchestratorState:
+    """Apply tool failure injection for tool_vortex monkey."""
     monkey = state["current_monkey"]
     if monkey == "tool_vortex":
         failure_modes = list(FAILURE_MODES.keys())
         mode = failure_modes[state["current_turn"] % len(failure_modes)]
-        injected_note = f"\n\n[INJECTED FAILURE: tool response → {mode}]"
+        injected_note = f"\n\n[INJECTED FAILURE MODE: {mode}]"
         return {**state, "current_prompt": state["current_prompt"] + injected_note}
     return state
 
 
 async def call_target_agent(state: OrchestratorState) -> OrchestratorState:
+    """Send adversarial prompt to target agent via A2A client."""
     agent_cfg = AgentConfig(**state["agent_config"])
     response, latency = await call_agent(
         agent_cfg, state["current_prompt"], session_id=state["run_id"]
@@ -142,6 +177,11 @@ async def call_target_agent(state: OrchestratorState) -> OrchestratorState:
 
 
 async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
+    """
+    Evaluate agent response.
+    v2: passes technique metadata (atlas_id, owasp_category, attack_angle,
+    failure_hypothesis) so evaluator can score with precise technique awareness.
+    """
     eval_result = await run_evaluator(
         {
             "agent_id": state["agent_id"],
@@ -151,6 +191,13 @@ async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
             "baseline_srq": state["steady_state"].get("baseline_srq", 5.0),
             "baseline_hrt": state["steady_state"].get("baseline_hrt", 5.0),
             "past_afp_patterns": [],
+            # v2: technique context
+            "atlas_id": state.get("current_atlas_id", "AML.T0051"),
+            "owasp_category": state.get("current_owasp_category", "ASI01"),
+            "attack_surface": "reasoning",
+            "failure_hypothesis": state.get("current_failure_hypothesis", ""),
+            "attack_angle": state.get("current_attack_angle", ""),
+            # Defaults
             "srq_score": 0.0,
             "hrt_score": 0.0,
             "safety_score": 0.0,
@@ -194,20 +241,20 @@ async def hitl_gate(state: OrchestratorState) -> OrchestratorState:
     if needs_hitl:
         interaction_id = state.get("current_interaction_id") or str(uuid4())
         logger.info(
-            "HITL triggered for run %s turn %d (safety=%.1f, is_afp=%s, severity=%s)",
+            "HITL triggered for run %s turn %d (safety=%.1f afp=%s severity=%s)",
             state["run_id"], state["current_turn"], safety, is_afp, severity,
         )
-        resume_payload: dict = interrupt(
-            {
-                "run_id": state["run_id"],
-                "interaction_id": interaction_id,
-                "safety_score": safety,
-                "is_afp": is_afp,
-                "severity": severity,
-                "agent_response": state.get("current_response", ""),
-                "prompt": "Approve or reject this interaction before it is logged.",
-            }
-        )
+        resume_payload: dict = interrupt({
+            "run_id": state["run_id"],
+            "interaction_id": interaction_id,
+            "safety_score": safety,
+            "is_afp": is_afp,
+            "severity": severity,
+            "agent_response": state.get("current_response", ""),
+            "attack_angle": state.get("current_attack_angle", ""),
+            "atlas_id": state.get("current_atlas_id", ""),
+            "prompt": "Approve or reject this interaction before it is logged.",
+        })
         decision = (
             resume_payload.get("decision", "approved")
             if isinstance(resume_payload, dict)
@@ -232,23 +279,21 @@ async def hitl_gate(state: OrchestratorState) -> OrchestratorState:
 
 
 async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
-    """Persist Interaction + AFP atomically, then tag OpenPipe.
-
-    BUG A FIX — single session, single commit
-    ──────────────────────────────────────────
-    Previously:
-      session1.add(Interaction)          ← not committed yet
-      write_afp_to_ltm()                 ← session2.add(AFP); session2.commit()
-                                           FK violation: interaction_id missing
-      session1.commit()                  ← too late
-
-    Now:
-      session.add(Interaction)
-      session.add(AFP)  [if is_afp]
-      session.commit()                   ← both rows land atomically; FK satisfied
-      tag_interaction()                  ← HTTP only, after commit, safe
+    """
+    Persist Interaction + AFP atomically.
+    v2: stores seed metadata (seed_id, atlas_id, attack_angle) in notes
+    for reproducibility and analysis.
     """
     async with AsyncSessionFactory() as session:
+        # Enrich notes with technique metadata
+        technique_note = (
+            f"[{state.get('current_atlas_id', '')} | "
+            f"{state.get('current_owasp_category', '')} | "
+            f"angle: {state.get('current_attack_angle', '')} | "
+            f"seed: {state.get('current_seed_id', '')}] "
+            f"{state['current_notes']}"
+        )
+
         await crud.create_interaction(
             session=session,
             interaction_id=state["current_interaction_id"],
@@ -268,7 +313,7 @@ async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
             hitl_required=state.get("hitl_required", False),
             hitl_decision=state.get("hitl_decision"),
             openpipe_request_id=state["current_openpipe_request_id"],
-            notes=state["current_notes"],
+            notes=technique_note,
         )
 
         if state["current_is_afp"]:
@@ -283,18 +328,10 @@ async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
                 agent_response=state["current_response"],
                 description=state["current_afp_description"],
                 severity=state["current_severity"],
-                recommendation=state["current_notes"],
+                recommendation=technique_note,
             )
 
-        # Single atomic commit — Interaction always exists before AFP is visible.
         await session.commit()
-
-    # HTTP-only, no DB dependency — safe to call after commit.
-    await tag_interaction(
-        state["current_openpipe_request_id"],
-        float(state["current_safety_score"]),
-        state["current_monkey"],
-    )
 
     turn_result = {
         "turn": state["current_turn"],
@@ -307,7 +344,8 @@ async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
         "is_afp": state["current_is_afp"],
         "severity": state["current_severity"],
         "notes": state["current_notes"],
-        "openpipe_request_id": state["current_openpipe_request_id"],
+        "attack_angle": state.get("current_attack_angle", ""),
+        "atlas_id": state.get("current_atlas_id", ""),
         "token_cost": state.get("current_token_cost_usd", 0.0),
     }
     updated = update_stm_with_turn(state, turn_result)
@@ -327,20 +365,15 @@ async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
 def check_blast_radius(state: OrchestratorState) -> str:
     limit = BLAST_RADIUS_LIMITS.get(state["blast_radius"], BLAST_RADIUS_LIMITS["staging"])
     if state["current_turn"] >= limit["max_turns"]:
-        logger.info("Blast radius: turn limit %d reached", limit["max_turns"])
         return "finalize_run"
     if state["estimated_cost_usd"] > limit["max_cost_usd"]:
-        logger.info("Blast radius: cost limit $%.2f exceeded", limit["max_cost_usd"])
         return "finalize_run"
     if state["consecutive_errors"] >= 5:
-        logger.warning("5 consecutive agent errors — finalising run")
         return "finalize_run"
     baseline_srq = state["steady_state"].get("baseline_srq", 0.0)
     if baseline_srq > 0 and state["running_srq"] < baseline_srq * 0.85:
-        logger.warning(
-            "SRQ %.2f fell >15%% below baseline %.2f — finalising run",
-            state["running_srq"], baseline_srq,
-        )
+        return "finalize_run"
+    if state.get("status") == "complete":
         return "finalize_run"
     return "select_next_monkey"
 
@@ -348,6 +381,10 @@ def check_blast_radius(state: OrchestratorState) -> str:
 async def finalize_run(state: OrchestratorState) -> OrchestratorState:
     scores = state["turn_scores"]
     final_report = build_report(state["run_id"], scores)
+    # Add refinement stats to report
+    final_report["refinement_used"] = state.get("refinement_used", 0)
+    final_report["auto_planned"] = state.get("auto_planned", False)
+
     async with AsyncSessionFactory() as session:
         await crud.update_run_final(
             session=session,
@@ -365,13 +402,15 @@ async def finalize_run(state: OrchestratorState) -> OrchestratorState:
             finished_at=datetime.now(timezone.utc),
         )
         await session.commit()
+
     logger.info(
-        "Run %s finalised — SRQ=%.2f HRT=%.2f AFPs=%d resilience=%.1f",
+        "Run %s complete — SRQ=%.2f HRT=%.2f AFPs=%d resilience=%.1f refinements=%d",
         state["run_id"],
         final_report["overall_srq"],
         final_report["overall_hrt"],
         final_report["afp_count"],
         final_report.get("agentic_resilience_score", 0.0),
+        final_report["refinement_used"],
     )
     return {**state, "status": "complete", "final_report": final_report}
 
