@@ -1,4 +1,14 @@
-"""Google OAuth routes for ChaosAgent login flow."""
+"""Google OAuth routes — legacy / unused.
+
+NOTE: ChaosAgent v2 uses Streamlit's native OIDC flow (st.login / st.user)
+combined with Google ID token verification in backend/auth/dependencies.py.
+This FastAPI router is NOT registered in main.py and exists only for reference.
+
+BUG-16 fix: the original file imported `create_jwt` from auth.dependencies
+but that function does not exist there, causing an ImportError if the module
+was ever loaded. The import is removed; if a standalone JWT flow is needed
+in future, implement create_jwt in dependencies.py first.
+"""
 
 from __future__ import annotations
 
@@ -10,7 +20,6 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import RedirectResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from backend.auth.dependencies import create_jwt
 from backend.config import settings
 from backend.db.crud import get_or_create_user
 from backend.db.session import get_db
@@ -22,10 +31,11 @@ router = APIRouter(prefix="/auth", tags=["auth"])
 @router.get("/google")
 async def auth_google() -> RedirectResponse:
     """Redirect users to Google OAuth consent endpoint."""
+    redirect_uri = getattr(settings, "google_redirect_uri", "http://localhost:8501/oauth2callback")
     params = urlencode(
         {
             "client_id": settings.google_client_id,
-            "redirect_uri": settings.google_redirect_uri,
+            "redirect_uri": redirect_uri,
             "response_type": "code",
             "scope": "openid email profile",
             "access_type": "online",
@@ -37,13 +47,13 @@ async def auth_google() -> RedirectResponse:
 
 @router.get("/google/callback")
 async def auth_google_callback(code: str, db: AsyncSession = Depends(get_db)) -> RedirectResponse:
-    """Handle OAuth callback and redirect to Streamlit with JWT token."""
+    """Handle OAuth callback.
+
+    This route is not registered in main.py — it exists for reference only.
+    The active auth path is Streamlit OIDC → Google ID token → dependencies.py.
+    """
     if not code:
         raise HTTPException(status_code=400, detail="Missing OAuth authorization code")
-    if settings.dev_bypass_auth:
-        user = await get_or_create_user(db, email="dev@chaosagent.local", name="Dev User")
-        token = create_jwt(email=user.email, name=user.name, user_id=str(user.id))
-        return RedirectResponse(url=f"{settings.streamlit_url}/?token={token}")
     try:
         async with httpx.AsyncClient(timeout=20.0) as client:
             token_resp = await client.post(
@@ -52,7 +62,7 @@ async def auth_google_callback(code: str, db: AsyncSession = Depends(get_db)) ->
                     "code": code,
                     "client_id": settings.google_client_id,
                     "client_secret": settings.google_client_secret,
-                    "redirect_uri": settings.google_redirect_uri,
+                    "redirect_uri": getattr(settings, "google_redirect_uri", ""),
                     "grant_type": "authorization_code",
                 },
             )
@@ -70,7 +80,6 @@ async def auth_google_callback(code: str, db: AsyncSession = Depends(get_db)) ->
         logger.exception("Google OAuth callback failed")
         raise HTTPException(status_code=502, detail=f"OAuth provider request failed: {exc}") from exc
 
-    user = await get_or_create_user(db, email=profile["email"], name=profile.get("name", profile["email"]))
-    token = create_jwt(email=user.email, name=user.name, user_id=str(user.id))
-    return RedirectResponse(url=f"{settings.streamlit_url}/?token={token}")
-
+    await get_or_create_user(db, email=profile["email"], name=profile.get("name", profile["email"]))
+    # Redirect to Streamlit — token issuance not implemented here (use Streamlit OIDC)
+    return RedirectResponse(url=settings.streamlit_url)

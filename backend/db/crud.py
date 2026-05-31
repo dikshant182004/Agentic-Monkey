@@ -6,11 +6,14 @@ All functions accept an AsyncSession and are designed to be called from:
 
 Fixes applied
 ─────────────
-BUG 1/14  get_run() requires a user_id scope (correct for API routes). Added
+BUG-1/14  get_run() requires a user_id scope (correct for API routes). Added
           get_run_unscoped() for internal callers (orchestrator stream poller)
           that need to look up a Run by id only, without a user filter.
           The original code passed user_id=None which produced SQL
           WHERE user_id = NULL — a condition that never matches.
+
+BUG-9     Added list_interactions() and list_afps_for_run() so the dashboard
+          and the new API routes can fetch per-turn and AFP data.
 
 Important:
   - Never raise on "not found" — return None instead (callers handle 404)
@@ -119,11 +122,9 @@ async def get_run(session: AsyncSession, run_id: str, user_id: str) -> Run | Non
 async def get_run_unscoped(session: AsyncSession, run_id: str) -> Run | None:
     """Fetch one run by id WITHOUT a user scope check.
 
-    BUG 1/14 FIX: Internal callers (e.g. the SSE stream poller in
-    orchestrator.py) do not have a user_id available. The original code
-    passed user_id=None to get_run() which produced SQL WHERE user_id = NULL
-    — a condition that never matches. This function is the correct internal
-    alternative.
+    For internal callers (e.g. the SSE stream poller in orchestrator.py) that do
+    not have a user_id available. Using get_run(..., user_id=None) produces SQL
+    WHERE user_id = NULL which never matches any row.
     """
     return await session.scalar(select(Run).where(Run.id == run_id))
 
@@ -211,6 +212,19 @@ async def create_interaction(
     # NOTE: caller is responsible for commit() to allow batching
 
 
+async def list_interactions(session: AsyncSession, run_id: str) -> list[Interaction]:
+    """Return all interactions for a run ordered by turn number.
+
+    BUG-9 addition — needed by dashboard and GET /runs/{id}/interactions route.
+    """
+    rows = await session.scalars(
+        select(Interaction)
+        .where(Interaction.run_id == run_id)
+        .order_by(Interaction.turn)
+    )
+    return list(rows)
+
+
 # ── AFP ────────────────────────────────────────────────────────────────────────
 
 async def create_afp(
@@ -243,6 +257,19 @@ async def create_afp(
         )
     )
     # NOTE: caller is responsible for commit()
+
+
+async def list_afps_for_run(session: AsyncSession, run_id: str) -> list[AFP]:
+    """Return all AFP records for a run ordered by creation time.
+
+    BUG-9 addition — needed by dashboard and GET /runs/{id}/afps route.
+    """
+    rows = await session.scalars(
+        select(AFP)
+        .where(AFP.run_id == run_id)
+        .order_by(AFP.created_at)
+    )
+    return list(rows)
 
 
 async def load_afp_patterns(

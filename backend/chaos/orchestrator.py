@@ -1,26 +1,33 @@
 """Thin orchestrator façade for API-facing run execution and SSE streaming.
 
-Fixes applied
-─────────────
-BUG 1  stream_run_events called crud.get_run(session, run_id, user_id=None).
-       SQL WHERE user_id = NULL never matches any row. Now queries directly by
+Fixes applied (vs original)
+───────────────────────────
+BUG-1  stream_run_events called crud.get_run(session, run_id, user_id=None).
+       SQL WHERE user_id = NULL never matches any row.  Now queries directly by
        run_id only (no user scope needed — this is an internal poller).
 
-BUG 3/7 No stall detection when the graph is stuck INSIDE a node (LLM call
-        hanging). snapshot.values is populated from the previous checkpoint so
-        stall_ticks never incremented. Now we track last_seen_turn and count
-        ticks where the turn counter does not advance; after 150 s we give up.
+BUG-3  hitl_required SSE event was missing atlas_id and attack_angle.
+       The Streamlit HITL panel reads both fields to display technique context.
+       They are now forwarded from the interrupt payload (preferred) or from
+       the checkpoint state (fallback).
 
-BUG 8  _mark_run_failed overwrote blast_radius with "unknown" and cleared
+BUG-4  progress SSE event was missing attack_angle and atlas_id.
+       The Streamlit run page tries to display the current attack angle inline.
+       Both fields are now included in the progress payload.
+
+BUG-7  No stall detection when the graph is stuck INSIDE a node (LLM call
+       hanging). snapshot.values is populated from the previous checkpoint so
+       stall_ticks never incremented. Now we track last_seen_turn and count
+       ticks where the turn counter does not advance; after 150 s we give up.
+
+BUG-8  _mark_run_failed overwrote blast_radius with "unknown" and cleared
        monkeys_selected. We now query the Run row first and preserve the
        original values, only patching status / finished_at / error fields.
 
-BUG 9/16 HITL detection broken: in LangGraph 1.x the graph is suspended
+BUG-9/16 HITL detection broken: in LangGraph 1.x the graph is suspended
          INSIDE interrupt(); the checkpoint written before that call already has
          hitl_pending=False. stream_run_events must inspect snapshot.tasks[].interrupts
          to discover a pending interrupt rather than relying on the state flag.
-         The orchestrator_graph.py also now sets hitl_pending=True one node
-         earlier (before interrupt()) so the checkpoint carries it as a fallback.
 """
 
 from __future__ import annotations
@@ -77,8 +84,6 @@ def _detect_hitl_interrupt(snapshot) -> dict | None:
         for task in tasks:
             interrupts = getattr(task, "interrupts", None) or ()
             for intr in interrupts:
-                # PregelInterrupt has a .value attribute holding the dict we
-                # passed to interrupt({...}) in hitl_gate.
                 value = getattr(intr, "value", None)
                 if isinstance(value, dict):
                     return value
@@ -89,8 +94,6 @@ def _detect_hitl_interrupt(snapshot) -> dict | None:
 
 async def _get_run_by_id(run_id: str) -> Run | None:
     """Fetch a Run row by id only — no user-scope filter (internal use)."""
-    # BUG 1 FIX: original code passed user_id=None which produced
-    # WHERE user_id = NULL — a condition that never matches in SQL.
     async with AsyncSessionFactory() as session:
         return await session.scalar(select(Run).where(Run.id == run_id))
 
@@ -98,8 +101,8 @@ async def _get_run_by_id(run_id: str) -> Run | None:
 async def _mark_run_failed(run_id: str, error: str) -> None:
     """Write failed status to the run record so SSE consumers see it.
 
-    BUG 8 FIX: We no longer hard-code blast_radius='unknown' or clear
-    monkeys_selected. We fetch the existing row and preserve those values.
+    Preserves blast_radius and monkeys_selected from the existing row
+    instead of overwriting them with placeholder values.
     """
     try:
         async with AsyncSessionFactory() as session:
@@ -110,8 +113,8 @@ async def _mark_run_failed(run_id: str, error: str) -> None:
                 session=session,
                 run_id=run_id,
                 status="failed",
-                blast_radius=run.blast_radius,          # preserve original
-                monkeys_selected=run.monkeys_selected,  # preserve original
+                blast_radius=run.blast_radius,
+                monkeys_selected=run.monkeys_selected,
                 overall_srq=run.overall_srq,
                 overall_hrt=run.overall_hrt,
                 overall_safety=run.overall_safety,
@@ -129,26 +132,19 @@ async def _mark_run_failed(run_id: str, error: str) -> None:
 async def stream_run_events(run_id: str):
     """Yield periodic SSE events by polling checkpoint state.
 
-    Fixes applied
-    ─────────────
-    BUG 1  Uses _get_run_by_id (no user_id filter) so the failed-run check
-           actually works.
-    BUG 3/7 Tracks last_seen_turn and stall_ticks_no_progress separately from
-            the pre-checkpoint stall counter so a graph stuck inside a long LLM
-            call is eventually surfaced as an error instead of looping forever.
-    BUG 9/16 Uses _detect_hitl_interrupt(snapshot) to inspect snapshot.tasks
-             for pending interrupts, which is the correct LangGraph 1.x way to
-             detect a suspended graph.
+    BUG-3 fix: hitl_required event now forwards atlas_id and attack_angle
+               from the interrupt payload so the Streamlit HITL panel can
+               display the technique context for the paused interaction.
+
+    BUG-4 fix: progress event now includes attack_angle and atlas_id so the
+               Streamlit run page can show the current attack angle inline.
     """
     checkpointer = await get_redis_checkpointer()
     graph = build_orchestrator_graph(checkpointer)
     config = run_thread_id(run_id)
     last_heartbeat = 0.0
 
-    # Stall tracking before first checkpoint
     stall_ticks_no_checkpoint = 0
-
-    # Stall tracking when graph is stuck INSIDE a node (turn not advancing)
     last_seen_turn: int = -1
     stall_ticks_no_progress: int = 0
 
@@ -158,7 +154,7 @@ async def stream_run_events(run_id: str):
 
         # ── No checkpoint yet ─────────────────────────────────────────────────
         if snapshot is None or not snapshot.values:
-            run = await _get_run_by_id(run_id)  # BUG 1 FIX
+            run = await _get_run_by_id(run_id)
             if run is not None and run.status == "failed":
                 yield _sse_event(
                     "error",
@@ -182,7 +178,7 @@ async def stream_run_events(run_id: str):
         state: dict = dict(snapshot.values)
         current_turn: int = state.get("current_turn", 0)
 
-        # ── BUG 3/7 FIX: stall detection when stuck inside a node ─────────────
+        # ── Stall detection: graph stuck inside a node ─────────────────────────
         if current_turn == last_seen_turn:
             stall_ticks_no_progress += 1
         else:
@@ -201,17 +197,13 @@ async def stream_run_events(run_id: str):
             )
             break
 
-        # ── BUG 9/16 FIX: HITL detection via snapshot.tasks ──────────────────
-        # In LangGraph 1.x the graph is suspended INSIDE interrupt(). The
-        # checkpoint has hitl_pending=False but snapshot.tasks carries the
-        # interrupt payload. Prefer this over the state flag.
+        # ── HITL detection via snapshot.tasks (LangGraph 1.x) ─────────────────
         hitl_payload = _detect_hitl_interrupt(snapshot)
-
-        # Fallback: old-style hitl_pending flag (set before interrupt() in
-        # orchestrator_graph.py as belt-and-suspenders).
         hitl_via_flag = state.get("hitl_pending", False)
 
         if hitl_payload or hitl_via_flag:
+            # BUG-3 FIX: forward atlas_id and attack_angle from the interrupt
+            # payload so the Streamlit HITL panel can show technique context.
             yield _sse_event(
                 "hitl_required",
                 {
@@ -236,6 +228,22 @@ async def stream_run_events(run_id: str):
                         if hitl_payload
                         else state.get("current_response", "")
                     ),
+                    # BUG-3 FIX ↓ — previously missing, Streamlit showed "unknown"
+                    "atlas_id": (
+                        hitl_payload.get("atlas_id", "")
+                        if hitl_payload
+                        else state.get("current_atlas_id", "")
+                    ),
+                    "attack_angle": (
+                        hitl_payload.get("attack_angle", "")
+                        if hitl_payload
+                        else state.get("current_attack_angle", "")
+                    ),
+                    "attack_surface": (
+                        hitl_payload.get("attack_surface", "")
+                        if hitl_payload
+                        else state.get("current_attack_surface", "")
+                    ),
                 },
             )
 
@@ -254,14 +262,18 @@ async def stream_run_events(run_id: str):
             break
 
         else:
+            # BUG-4 FIX: include attack_angle and atlas_id in progress events
             yield _sse_event(
                 "progress",
                 {
-                    "run_id": run_id,
-                    "turn": current_turn,
-                    "monkey_type": state.get("current_monkey", ""),
-                    "running_srq": state.get("running_srq", 0.0),
-                    "status": state.get("status", "running"),
+                    "run_id":       run_id,
+                    "turn":         current_turn,
+                    "monkey_type":  state.get("current_monkey", ""),
+                    "running_srq":  state.get("running_srq", 0.0),
+                    "status":       state.get("status", "running"),
+                    # BUG-4 FIX ↓ — previously missing
+                    "attack_angle": state.get("current_attack_angle", ""),
+                    "atlas_id":     state.get("current_atlas_id", ""),
                 },
             )
 

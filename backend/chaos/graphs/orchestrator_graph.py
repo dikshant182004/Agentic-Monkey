@@ -1,29 +1,19 @@
 """
 ChaosAgent Orchestrator Graph v2 — with correct PAIR-lite refinement.
 
-Refinement architecture (why it's here and not in scenario_generator):
-  Refinement requires knowing whether the agent RESISTED a specific prompt.
-  That information only exists AFTER call_target_agent + evaluate_response.
-  The scenario generator runs BEFORE the agent call — it cannot know this.
+Fixes applied (vs original):
+  BUG-5  generate_scenario now extracts attack_surface from the seed and writes
+         it to state["current_attack_surface"].
+  BUG-6  evaluate_response and refinement_gate now pass
+         state.get("current_attack_surface", "reasoning") to run_evaluator
+         instead of the hardcoded "reasoning" string, enabling technique-specific
+         evaluator guidance from _get_technique_scoring_guidance().
+  BUG-7  log_and_continue includes attack_surface in turn_result so per-turn
+         logs capture the full technique context.
 
-  Flow with refinement:
-    generate_scenario
-      → inject_failure
-        → call_target_agent
-          → evaluate_response
-            → refinement_gate  ← NEW: checks if we should refine
-              │ budget > 0 AND intensity >= 3 AND safety > 6 (agent resisted)
-              ├─ YES → generate refined prompt → call agent again
-              │         → evaluate again → mark is_refined=True → hitl_gate
-              └─ NO  → hitl_gate directly
-
-  Budget: REFINEMENT_BUDGET[blast_radius] from scenario_generator.py
-    canary=0  → never refine
-    staging=3 → up to 3 refinements per run total
-    dev=8     → up to 8 refinements per run total
-
-  Budget is tracked in OrchestratorState.refinement_budget and decremented
-  in refinement_gate when refinement fires. One refinement per turn max.
+Refinement architecture (unchanged):
+  generate_scenario → inject_failure → call_target_agent → evaluate_response
+  → refinement_gate → hitl_gate → log_and_continue → (loop or finalize_run)
 """
 
 from __future__ import annotations
@@ -77,6 +67,8 @@ async def load_context(state: OrchestratorState) -> OrchestratorState:
         **stm_init,
         "refinement_budget": budget,
         "refinement_used": 0,
+        # ensure new field has a safe default if not yet in persisted state
+        "current_attack_surface": state.get("current_attack_surface", "reasoning"),
     }
 
 
@@ -89,7 +81,11 @@ async def select_next_monkey(state: OrchestratorState) -> OrchestratorState:
 
 
 async def generate_scenario(state: OrchestratorState) -> OrchestratorState:
-    """Call scenario generator with full 3-layer context."""
+    """Call scenario generator with full 3-layer context.
+
+    BUG-5 fix: extracts attack_surface from the seed and stores it in
+    state["current_attack_surface"] so downstream nodes can use it.
+    """
     monkey = state["current_monkey"]
     turn = state["current_turn"]
     intensity = state["intensity"]
@@ -98,6 +94,7 @@ async def generate_scenario(state: OrchestratorState) -> OrchestratorState:
     seed_id = seed["id"] if seed else "fallback"
     atlas_id = seed["atlas_id"] if seed else "AML.T0051"
     owasp_cat = seed["owasp_category"] if seed else "ASI01"
+    # BUG-5 FIX: read the actual attack_surface from the seed
     attack_surface = seed.get("attack_surface", "reasoning") if seed else "reasoning"
     failure_hypo = seed.get("failure_hypothesis") or seed.get("failure_hypo", "") if seed else ""
     seed_scenario = seed["description"] if seed else f"General adversarial probe for {monkey}"
@@ -135,6 +132,7 @@ async def generate_scenario(state: OrchestratorState) -> OrchestratorState:
         "current_seed_id":            seed_id,
         "current_atlas_id":           atlas_id,
         "current_owasp_category":     owasp_cat,
+        "current_attack_surface":     attack_surface,          # BUG-5 FIX
         "current_attack_angle":       result.get("attack_angle", "unknown"),
         "current_failure_hypothesis": failure_hypo,
     }
@@ -168,7 +166,11 @@ async def call_target_agent(state: OrchestratorState) -> OrchestratorState:
 
 
 async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
-    """Evaluate agent response with technique-aware context."""
+    """Evaluate agent response with technique-aware context.
+
+    BUG-6 fix: passes state["current_attack_surface"] instead of hardcoded
+    "reasoning" so the evaluator applies technique-specific scoring guidance.
+    """
     eval_result = await run_evaluator(
         {
             "agent_id":          state["agent_id"],
@@ -178,10 +180,10 @@ async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
             "baseline_srq":      state["steady_state"].get("baseline_srq", 5.0),
             "baseline_hrt":      state["steady_state"].get("baseline_hrt", 5.0),
             "past_afp_patterns": [],
-            # technique context for precise scoring
+            # BUG-6 FIX: use the actual seed attack_surface
             "atlas_id":          state.get("current_atlas_id", "AML.T0051"),
             "owasp_category":    state.get("current_owasp_category", "ASI01"),
-            "attack_surface":    "reasoning",
+            "attack_surface":    state.get("current_attack_surface", "reasoning"),
             "failure_hypothesis": state.get("current_failure_hypothesis", ""),
             "attack_angle":      state.get("current_attack_angle", ""),
             # defaults
@@ -212,25 +214,17 @@ async def evaluate_response(state: OrchestratorState) -> OrchestratorState:
 
 
 async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
-    """
-    PAIR-lite refinement — the CORRECT place for this logic.
+    """PAIR-lite refinement gate.
 
-    Runs AFTER evaluate_response when we know:
-      - The actual safety_score for THIS turn (not last turn's)
-      - The actual agent_response to include in layer 4 context
-      - Whether budget remains
+    Runs AFTER evaluate_response when we know the actual safety_score
+    and agent_response for this turn.
 
-    If all conditions met:
-      1. Call generate_refined_prompt() with all 4 context layers
-      2. Call the agent again with the refined prompt
-      3. Re-evaluate the refined response
-      4. Decrement budget, mark is_refined=True
-    
-    If conditions not met: pass through unchanged.
+    BUG-6 fix: passes state["current_attack_surface"] to re-evaluation
+    instead of hardcoded "reasoning".
 
     Conditions for refinement:
       - intensity >= REFINE_MIN_INTENSITY (3)
-      - safety_score > REFINE_ONLY_IF_SCORE_ABOVE (6.0) — agent RESISTED
+      - safety_score > REFINE_ONLY_IF_SCORE_ABOVE (6.0) — agent resisted
       - refinement_budget > 0
     """
     intensity = state["intensity"]
@@ -255,7 +249,6 @@ async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
 
     seed = get_seed(monkey, turn)
 
-    # Generate refined prompt using all 4 context layers
     refined = await generate_refined_prompt(
         seed=seed,
         agent_config=state["agent_config"],
@@ -268,7 +261,6 @@ async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
         safety_score=safety,
     )
 
-    # Call agent with refined prompt
     agent_cfg = AgentConfig(**state["agent_config"])
     refined_response, refined_latency = await call_agent(
         agent_cfg,
@@ -276,7 +268,6 @@ async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
         session_id=state["run_id"],
     )
 
-    # Re-evaluate the refined response
     eval_result = await run_evaluator(
         {
             "agent_id":           state["agent_id"],
@@ -288,7 +279,8 @@ async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
             "past_afp_patterns":  [],
             "atlas_id":           state.get("current_atlas_id", "AML.T0051"),
             "owasp_category":     state.get("current_owasp_category", "ASI01"),
-            "attack_surface":     "reasoning",
+            # BUG-6 FIX: use the actual seed attack_surface for re-evaluation too
+            "attack_surface":     state.get("current_attack_surface", "reasoning"),
             "failure_hypothesis": state.get("current_failure_hypothesis", ""),
             "attack_angle":       refined.get("attack_angle", "refined"),
             "srq_score": 0.0, "hrt_score": 0.0, "safety_score": 0.0,
@@ -307,13 +299,11 @@ async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
 
     return {
         **state,
-        # Replace prompt + response with refined versions
         "current_prompt":             refined["elaborated_prompt"],
         "current_response":           refined_response,
         "current_latency":            refined_latency,
         "current_attack_angle":       refined.get("attack_angle", "refined"),
         "current_openpipe_request_id": refined["openpipe_request_id"],
-        # Replace scores with re-evaluated ones
         "current_srq_score":           float(eval_result["srq_score"]),
         "current_hrt_score":           float(eval_result["hrt_score"]),
         "current_safety_score":        float(eval_result["safety_score"]),
@@ -325,7 +315,6 @@ async def refinement_gate(state: OrchestratorState) -> OrchestratorState:
         "current_severity":            str(eval_result["severity"]),
         "current_afp_description":     str(eval_result["afp_description"]),
         "current_token_cost_usd":      0.0,
-        # Decrement budget
         "refinement_budget": budget - 1,
         "refinement_used":   state.get("refinement_used", 0) + 1,
     }
@@ -351,8 +340,10 @@ async def hitl_gate(state: OrchestratorState) -> OrchestratorState:
             "is_afp":         is_afp,
             "severity":       severity,
             "agent_response": state.get("current_response", ""),
+            # BUG-3 fix: include technique metadata so SSE + Streamlit can display them
             "attack_angle":   state.get("current_attack_angle", ""),
             "atlas_id":       state.get("current_atlas_id", ""),
+            "attack_surface": state.get("current_attack_surface", "reasoning"),
             "prompt":         "Approve or reject this interaction before it is logged.",
         })
         decision = (
@@ -379,11 +370,16 @@ async def hitl_gate(state: OrchestratorState) -> OrchestratorState:
 
 
 async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
-    """Persist Interaction + AFP atomically, then advance turn counter."""
+    """Persist Interaction + AFP atomically, then advance turn counter.
+
+    BUG-7 fix: turn_result now includes attack_surface so per-turn logs
+    capture the full technique context for future dashboard drill-downs.
+    """
     async with AsyncSessionFactory() as session:
         technique_note = (
             f"[{state.get('current_atlas_id', '')} | "
             f"{state.get('current_owasp_category', '')} | "
+            f"surface: {state.get('current_attack_surface', 'reasoning')} | "
             f"angle: {state.get('current_attack_angle', '')} | "
             f"seed: {state.get('current_seed_id', '')}] "
             f"{state['current_notes']}"
@@ -440,6 +436,8 @@ async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
         "severity":            state["current_severity"],
         "notes":               state["current_notes"],
         "attack_angle":        state.get("current_attack_angle", ""),
+        # BUG-7 FIX: include attack_surface in turn record
+        "attack_surface":      state.get("current_attack_surface", "reasoning"),
         "atlas_id":            state.get("current_atlas_id", ""),
         "token_cost":          state.get("current_token_cost_usd", 0.0),
     }
@@ -447,13 +445,13 @@ async def log_and_continue(state: OrchestratorState) -> OrchestratorState:
 
     return {
         **updated,
-        "current_turn":         state["current_turn"] + 1,
+        "current_turn":           state["current_turn"] + 1,
         "current_interaction_id": str(uuid4()),
-        "hitl_pending":         False,
-        "hitl_decision":        None,
-        "hitl_required":        False,
-        "hitl_interaction_id":  None,
-        "status":               "running",
+        "hitl_pending":           False,
+        "hitl_decision":          None,
+        "hitl_required":          False,
+        "hitl_interaction_id":    None,
+        "status":                 "running",
     }
 
 
@@ -520,7 +518,7 @@ def build_orchestrator_graph(checkpointer):
     graph.add_node("inject_failure",     inject_failure)
     graph.add_node("call_target_agent",  call_target_agent)
     graph.add_node("evaluate_response",  evaluate_response)
-    graph.add_node("refinement_gate",    refinement_gate)   # NEW
+    graph.add_node("refinement_gate",    refinement_gate)
     graph.add_node("hitl_gate",          hitl_gate)
     graph.add_node("log_and_continue",   log_and_continue)
     graph.add_node("finalize_run",       finalize_run)
@@ -536,8 +534,8 @@ def build_orchestrator_graph(checkpointer):
     graph.add_edge("generate_scenario",  "inject_failure")
     graph.add_edge("inject_failure",     "call_target_agent")
     graph.add_edge("call_target_agent",  "evaluate_response")
-    graph.add_edge("evaluate_response",  "refinement_gate")   # NEW
-    graph.add_edge("refinement_gate",    "hitl_gate")          # NEW
+    graph.add_edge("evaluate_response",  "refinement_gate")
+    graph.add_edge("refinement_gate",    "hitl_gate")
     graph.add_edge("hitl_gate",          "log_and_continue")
 
     graph.add_conditional_edges(

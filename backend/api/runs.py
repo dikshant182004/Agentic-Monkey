@@ -1,15 +1,11 @@
 """
-ChaosAgent Runs API — updated for v2.
+ChaosAgent Runs API — v2 with dashboard endpoints.
 
-Changes:
-  - POST /runs now accepts optional auto_plan=true flag.
-    When set, experiment config (monkeys, intensity, blast_radius, hypothesis)
-    is derived from the A2A card via experiment_planner.plan_experiment().
-    User-supplied values override auto-plan if provided.
-  - initial_state now includes all new OrchestratorState v2 fields:
-    refinement_budget, refinement_used, auto_planned, current_attack_angle,
-    current_seed_id, current_atlas_id, current_owasp_category,
-    current_failure_hypothesis.
+Changes vs original:
+  - POST /runs: initial_state now includes current_attack_surface (from states.py BUG-2 fix)
+  - GET /runs/{run_id}/interactions: new — returns per-turn data for dashboard charts
+  - GET /runs/{run_id}/afps: new — returns AFP list for dashboard heatmap
+  - GET /runs/plan: unchanged (must stay above /{run_id} to avoid param capture)
 """
 
 from __future__ import annotations
@@ -30,7 +26,7 @@ from backend.chaos.orchestrator import _mark_run_failed, run_chaos_experiment, s
 from backend.chaos.graphs import build_orchestrator_graph
 from backend.db import crud
 from backend.db.models import Run
-from backend.db.session import get_db, AsyncSessionFactory
+from backend.db.session import get_db
 from backend.a2a.parser import AgentConfig
 from backend.memory.redis_checkpointer import get_redis_checkpointer, run_thread_id
 from backend.schemas.runs import RunCreateRequest
@@ -58,14 +54,7 @@ async def create_run(
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """
-    Create run record and start orchestrator graph asynchronously.
-
-    If payload.auto_plan=True AND monkeys_selected is empty:
-      - Reads agent A2A card
-      - Calls experiment_planner.plan_experiment() to derive config
-      - User-supplied intensity/blast_radius/hypothesis override plan if set
-    """
+    """Create run record and start orchestrator graph asynchronously."""
     agent = await crud.get_agent(db, user.user_id, payload.agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -90,7 +79,7 @@ async def create_run(
     # Resolve final config (user overrides auto-plan)
     if plan:
         monkeys = payload.monkeys_selected or plan.monkeys_selected
-        intensity = payload.intensity if payload.intensity != 3 else plan.intensity  # 3 is default
+        intensity = payload.intensity if payload.intensity != 3 else plan.intensity
         blast = payload.blast_radius if payload.blast_radius != "staging" else plan.blast_radius
         hypothesis = payload.hypothesis.strip() or plan.hypothesis
     else:
@@ -170,8 +159,9 @@ async def create_run(
         "current_openpipe_request_id": "",
         "current_interaction_id": str(uuid4()),
         "current_token_cost_usd": 0.0,
-        # v2 seed metadata
+        # v2 seed / technique metadata — BUG-2 fix: current_attack_surface initialised
         "current_attack_angle": "",
+        "current_attack_surface": "reasoning",    # ← BUG-2 fix
         "current_seed_id": "",
         "current_atlas_id": "",
         "current_owasp_category": "",
@@ -204,16 +194,15 @@ async def create_run(
     return response
 
 
+# NOTE: /plan must be defined BEFORE /{run_id} so FastAPI doesn't route
+# GET /runs/plan to get_run with run_id="plan".
 @router.get("/plan")
 async def get_experiment_plan(
     agent_id: str,
     user: CurrentUser = Depends(get_current_user),
     db: AsyncSession = Depends(get_db),
 ) -> dict:
-    """
-    Preview the auto-generated experiment plan for an agent WITHOUT launching a run.
-    Useful for the UI to show the user what would be planned before they confirm.
-    """
+    """Preview the auto-generated experiment plan for an agent WITHOUT launching a run."""
     agent = await crud.get_agent(db, user.user_id, agent_id)
     if agent is None:
         raise HTTPException(status_code=404, detail="Agent not found")
@@ -251,7 +240,14 @@ async def list_runs(
             "id": str(item.id),
             "status": item.status,
             "blast_radius": item.blast_radius,
+            "monkeys_selected": item.monkeys_selected,
             "overall_srq": item.overall_srq,
+            "overall_hrt": item.overall_hrt,
+            "overall_safety": item.overall_safety,
+            "afp_count": item.afp_count,
+            "agentic_resilience_score": item.agentic_resilience_score,
+            "started_at": item.started_at.isoformat(),
+            "finished_at": item.finished_at.isoformat() if item.finished_at else None,
         }
         for item in runs
     ]
@@ -270,11 +266,83 @@ async def get_run(
         "id": str(run.id),
         "status": run.status,
         "blast_radius": run.blast_radius,
+        "monkeys_selected": run.monkeys_selected,
         "overall_srq": run.overall_srq,
         "overall_hrt": run.overall_hrt,
         "overall_safety": run.overall_safety,
         "afp_count": run.afp_count,
+        "agentic_resilience_score": run.agentic_resilience_score,
+        "estimated_cost_usd": run.estimated_cost_usd,
+        "config": run.config,
+        "started_at": run.started_at.isoformat(),
+        "finished_at": run.finished_at.isoformat() if run.finished_at else None,
     }
+
+
+@router.get("/{run_id}/interactions")
+async def list_run_interactions(
+    run_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """Return per-turn interaction data for dashboard charts.
+
+    BUG-10 addition — previously this route did not exist so the dashboard
+    had no way to fetch real SRQ/HRT/safety scores per turn.
+    """
+    run = await crud.get_run(db, run_id, user.user_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    interactions = await crud.list_interactions(db, run_id)
+    return [
+        {
+            "turn":                i.turn,
+            "monkey_type":         i.monkey_type,
+            "srq_score":           i.srq_score,
+            "hrt_score":           i.hrt_score,
+            "safety_score":        i.safety_score,
+            "reasoning_score":     i.reasoning_score,
+            "tool_recovery_score": i.tool_recovery_score,
+            "is_afp":              i.is_afp,
+            "self_corrected":      i.self_corrected,
+            "hitl_required":       i.hitl_required,
+            "hitl_decision":       i.hitl_decision,
+            "notes":               i.notes,
+            # Truncate prompt/response for the dashboard to keep payload small
+            "prompt_snippet":      i.prompt[:200],
+            "response_snippet":    i.agent_response[:200],
+            "created_at":          i.created_at.isoformat(),
+        }
+        for i in interactions
+    ]
+
+
+@router.get("/{run_id}/afps")
+async def list_run_afps(
+    run_id: str,
+    user: CurrentUser = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+) -> list[dict]:
+    """Return AFP discoveries for a run — used by dashboard heatmap.
+
+    BUG-10 addition.
+    """
+    run = await crud.get_run(db, run_id, user.user_id)
+    if run is None:
+        raise HTTPException(status_code=404, detail="Run not found")
+
+    afps = await crud.list_afps_for_run(db, run_id)
+    return [
+        {
+            "monkey_type":    a.monkey_type,
+            "severity":       a.severity,
+            "description":    a.description,
+            "recommendation": a.recommendation,
+            "created_at":     a.created_at.isoformat(),
+        }
+        for a in afps
+    ]
 
 
 @router.get("/{run_id}/live-state")

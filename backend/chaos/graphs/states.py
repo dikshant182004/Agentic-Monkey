@@ -3,9 +3,11 @@ ChaosAgent Graph State Schemas — updated for v2.
 
 Changes from v1:
   OrchestratorState:
-    + refinement_budget      int — remaining refinement calls this run
-    + current_attack_angle   str — attack angle used this turn (from generator)
-    + current_seed_id        str — seed ID used this turn (for logging)
+    + refinement_budget      int  — remaining refinement calls this run
+    + refinement_used        int  — total refinements used this run
+    + current_attack_angle   str  — attack angle used this turn (from generator)
+    + current_attack_surface str  — seed attack surface for precise evaluator guidance  ← NEW BUG-2
+    + current_seed_id        str  — seed ID used this turn (for logging)
     + auto_planned           bool — whether experiment was auto-planned from A2A card
 
   ScenarioGenState:
@@ -54,7 +56,7 @@ class ScenarioGenState(TypedDict):
     elaborated_prompt: str
     expected_behavior: str
     failure_hypothesis: str
-    attack_angle: str            # NEW: social engineering angle used
+    attack_angle: str            # social engineering angle used
     openpipe_request_id: str
 
 
@@ -79,10 +81,10 @@ class EvaluatorState(TypedDict):
     baseline_srq: float
     baseline_hrt: float
 
-    # NEW: technique context for more precise evaluation
+    # Technique context for more precise evaluation
     atlas_id: str                # MITRE ATLAS technique used
     owasp_category: str          # OWASP ASI category
-    attack_surface: str          # what was targeted
+    attack_surface: str          # what was targeted (reasoning/tools/memory/identity/…)
     failure_hypothesis: str      # what failure we were testing for
     attack_angle: str            # social engineering angle used
 
@@ -119,7 +121,7 @@ class OrchestratorState(TypedDict):
     blast_radius: str
     monkeys_selected: list[str]
     intensity: int
-    auto_planned: bool           # NEW: True if auto-planned from A2A card
+    auto_planned: bool           # True if auto-planned from A2A card
 
     # ── Run-time accumulation ─────────────────────────────────────────────────
     current_turn: int
@@ -131,8 +133,8 @@ class OrchestratorState(TypedDict):
     running_srq: float
 
     # ── Refinement budget ────────────────────────────────────────────────────
-    refinement_budget: int       # NEW: decremented each time refinement fires
-    refinement_used: int         # NEW: total refinements used this run
+    refinement_budget: int       # decremented each time refinement fires
+    refinement_used: int         # total refinements used this run
 
     # ── HITL fields ───────────────────────────────────────────────────────────
     hitl_pending: bool
@@ -163,9 +165,10 @@ class OrchestratorState(TypedDict):
     current_interaction_id: str
     current_token_cost_usd: float
 
-    # NEW: seed/technique metadata for logging
-    current_attack_angle: str    # social engineering angle used this turn
-    current_seed_id: str         # seed ID for reproducibility
-    current_atlas_id: str        # MITRE ATLAS technique
-    current_owasp_category: str  # OWASP ASI category
+    # ── Seed / technique metadata for logging ─────────────────────────────────
+    current_attack_angle: str        # social engineering angle used this turn
+    current_attack_surface: str      # seed attack surface (BUG-2 fix) ← NEW
+    current_seed_id: str             # seed ID for reproducibility
+    current_atlas_id: str            # MITRE ATLAS technique
+    current_owasp_category: str      # OWASP ASI category
     current_failure_hypothesis: str  # what we were testing for

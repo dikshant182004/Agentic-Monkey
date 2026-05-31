@@ -28,3 +28,4 @@ redis==5.2.1
 # will silently drop all OpenPipe request logging.
 streamlit
 plotly==6.0.1
+openai

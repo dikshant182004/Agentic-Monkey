@@ -1,6 +1,11 @@
-"""OpenPipe integration exports."""
+"""OpenPipe integration exports.
 
-from backend.openpipe.logger import llm_call
+BUG-14 fix: the original file exported only `llm_call` (synchronous) but every
+caller in the codebase uses `allm_call` (async wrapper). Exporting the wrong
+symbol was misleading and would cause AttributeError for any caller that
+imported from this package rather than directly from backend.openpipe.logger.
+"""
 
-__all__ = ["llm_call"]
+from backend.openpipe.logger import allm_call, llm_call
 
+__all__ = ["allm_call", "llm_call"]
