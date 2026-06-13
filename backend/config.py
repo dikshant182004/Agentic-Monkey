@@ -19,16 +19,15 @@ class Settings(BaseSettings):
 
     cerebras_api_key: str = Field(default="", alias="CEREBRAS_API_KEY")
     cerebras_base_url: str = Field(default="https://api.cerebras.ai/v1", alias="CEREBRAS_BASE_URL")
-    cerebras_model: str = Field(default="llama3.1-70b", alias="CEREBRAS_MODEL")
+    cerebras_model: str = Field(default="llama3.1-8b", alias="CEREBRAS_MODEL")
 
-    openpipe_api_key: str = Field(default="", alias="OPENPIPE_API_KEY")
     langchain_tracing_v2: bool = Field(default=True, alias="LANGCHAIN_TRACING_V2")
     langchain_api_key: str = Field(default="", alias="LANGCHAIN_API_KEY")
     langchain_project: str = Field(default="chaos-agent", alias="LANGCHAIN_PROJECT")
     redis_url: str = Field(default="redis://localhost:6379", alias="REDIS_URL")
     redis_checkpoint_ttl_hours: int = Field(default=24, alias="REDIS_CHECKPOINT_TTL_HOURS")
     database_url: str = Field(
-        default="postgresql+asyncpg://postgres:chaos123@localhost:5432/chaosagent",
+        default="postgresql+asyncpg://postgres:chaos123@localhost:5433/chaosagent",
         alias="DATABASE_URL",
     )
     streamlit_url: str = Field(default="http://localhost:8501", alias="STREAMLIT_URL")

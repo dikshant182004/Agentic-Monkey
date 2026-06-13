@@ -1,36 +1,63 @@
-"""Async CRUD operations for ChaosAgent persistence layer."""
+"""Async CRUD operations for ChaosAgent's PostgreSQL persistence layer.
+
+All functions accept an AsyncSession and are designed to be called from:
+  - FastAPI route handlers (via get_db() dependency)
+  - Orchestrator graph nodes (via AsyncSessionFactory() context manager)
+
+Fixes applied
+─────────────
+BUG-1/14  get_run() requires a user_id scope (correct for API routes). Added
+          get_run_unscoped() for internal callers (orchestrator stream poller)
+          that need to look up a Run by id only, without a user filter.
+          The original code passed user_id=None which produced SQL
+          WHERE user_id = NULL — a condition that never matches.
+
+BUG-9     Added list_interactions() and list_afps_for_run() so the dashboard
+          and the new API routes can fetch per-turn and AFP data.
+
+Important:
+  - Never raise on "not found" — return None instead (callers handle 404)
+  - commit() is the caller's responsibility for session-scoped operations
+  - Functions that write their own session use AsyncSessionFactory directly
+"""
 
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from uuid import UUID
+from uuid import UUID, uuid4
 
-from sqlalchemy import delete, desc, select
+from sqlalchemy import delete, desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.db.models import AFP, Agent, Interaction, Run, SteadyState, User
 
 
+# ── User ───────────────────────────────────────────────────────────────────────
+
 async def get_or_create_user(session: AsyncSession, email: str, name: str) -> User:
-    """Fetch a user by email or create one when absent."""
+    """Fetch a user by email or create one if absent (upsert pattern)."""
     existing = await session.scalar(select(User).where(User.email == email))
     if existing is not None:
         return existing
-    user = User(email=email, name=name)
+    user = User(id=uuid4(), email=email, name=name, created_at=datetime.now(timezone.utc))
     session.add(user)
     await session.commit()
     await session.refresh(user)
     return user
 
 
+# ── Agent ──────────────────────────────────────────────────────────────────────
+
 async def create_agent(session: AsyncSession, user_id: str, payload: dict) -> Agent:
     """Create and persist a new Agent row."""
     agent = Agent(
+        id=uuid4(),
         user_id=user_id,
         name=payload["name"],
         description=payload.get("description", ""),
         config=payload["config"],
         raw_card=payload["raw_card"],
+        created_at=datetime.now(timezone.utc),
     )
     session.add(agent)
     await session.commit()
@@ -39,51 +66,103 @@ async def create_agent(session: AsyncSession, user_id: str, payload: dict) -> Ag
 
 
 async def list_agents(session: AsyncSession, user_id: str) -> list[Agent]:
-    """Return all agents owned by a user."""
-    rows = await session.scalars(select(Agent).where(Agent.user_id == user_id).order_by(desc(Agent.created_at)))
+    """Return all agents owned by a user in reverse-chronological order."""
+    rows = await session.scalars(
+        select(Agent).where(Agent.user_id == user_id).order_by(desc(Agent.created_at))
+    )
     return list(rows)
 
 
 async def get_agent(session: AsyncSession, user_id: str, agent_id: str) -> Agent | None:
-    """Fetch one agent by id scoped to user."""
-    return await session.scalar(select(Agent).where(Agent.id == agent_id, Agent.user_id == user_id))
+    """Fetch one agent by id scoped to the given user (returns None if not found)."""
+    return await session.scalar(
+        select(Agent).where(Agent.id == agent_id, Agent.user_id == user_id)
+    )
 
 
-async def delete_agent_with_runs(session: AsyncSession, user_id: str, agent_id: str) -> bool:
-    """Delete an agent and dependent records via cascade relationships."""
-    result = await session.execute(delete(Agent).where(Agent.id == agent_id, Agent.user_id == user_id))
+async def delete_agent_with_runs(
+    session: AsyncSession, user_id: str, agent_id: str
+) -> bool:
+    """Delete an agent and all dependent records via DB cascade. Returns True if deleted."""
+    result = await session.execute(
+        delete(Agent).where(Agent.id == agent_id, Agent.user_id == user_id)
+    )
     await session.commit()
     return result.rowcount > 0
 
 
+# ── SteadyState ────────────────────────────────────────────────────────────────
+
 async def latest_steady_state(session: AsyncSession, agent_id: str) -> SteadyState | None:
-    """Fetch latest steady state baseline for an agent."""
+    """Fetch the most recent SteadyState baseline for an agent."""
     return await session.scalar(
-        select(SteadyState).where(SteadyState.agent_id == agent_id).order_by(desc(SteadyState.captured_at))
+        select(SteadyState)
+        .where(SteadyState.agent_id == agent_id)
+        .order_by(desc(SteadyState.captured_at))
     )
 
 
+# ── Run ────────────────────────────────────────────────────────────────────────
+
 async def list_runs(session: AsyncSession, user_id: str) -> list[Run]:
-    """List runs by user in reverse chronological order."""
-    rows = await session.scalars(select(Run).where(Run.user_id == user_id).order_by(desc(Run.started_at)))
+    """List all runs for the current user in reverse-chronological order."""
+    rows = await session.scalars(
+        select(Run).where(Run.user_id == user_id).order_by(desc(Run.started_at))
+    )
     return list(rows)
 
 
 async def get_run(session: AsyncSession, run_id: str, user_id: str) -> Run | None:
-    """Fetch one run by id scoped to user."""
-    return await session.scalar(select(Run).where(Run.id == run_id, Run.user_id == user_id))
-
-
-async def load_afp_patterns(session: AsyncSession, agent_id: str, monkey_type: str, limit: int = 10) -> list[str]:
-    """Load recent AFP descriptions for one agent and monkey type."""
-    rows = await session.scalars(
-        select(AFP.description)
-        .where(AFP.agent_id == agent_id, AFP.monkey_type == monkey_type)
-        .order_by(desc(AFP.created_at))
-        .limit(limit)
+    """Fetch one run by id scoped to user. For API routes — always requires user_id."""
+    return await session.scalar(
+        select(Run).where(Run.id == run_id, Run.user_id == user_id)
     )
-    return list(rows)
 
+
+async def get_run_unscoped(session: AsyncSession, run_id: str) -> Run | None:
+    """Fetch one run by id WITHOUT a user scope check.
+
+    For internal callers (e.g. the SSE stream poller in orchestrator.py) that do
+    not have a user_id available. Using get_run(..., user_id=None) produces SQL
+    WHERE user_id = NULL which never matches any row.
+    """
+    return await session.scalar(select(Run).where(Run.id == run_id))
+
+
+async def update_run_final(
+    session: AsyncSession,
+    run_id: str,
+    status: str,
+    blast_radius: str,
+    monkeys_selected: object,
+    overall_srq: float,
+    overall_hrt: float,
+    overall_safety: float,
+    afp_count: int,
+    ethical_drift_score: float,
+    agentic_resilience_score: float,
+    estimated_cost_usd: float,
+    finished_at: datetime,
+) -> None:
+    """Update terminal run record metrics in PostgreSQL."""
+    run = await session.scalar(select(Run).where(Run.id == run_id))
+    if run is None:
+        return
+    run.status = status
+    run.blast_radius = blast_radius
+    run.monkeys_selected = monkeys_selected
+    run.overall_srq = overall_srq
+    run.overall_hrt = overall_hrt
+    run.overall_safety = overall_safety
+    run.afp_count = afp_count
+    run.ethical_drift_score = ethical_drift_score
+    run.agentic_resilience_score = agentic_resilience_score
+    run.estimated_cost_usd = estimated_cost_usd
+    run.finished_at = finished_at
+    await session.commit()
+
+
+# ── Interaction ────────────────────────────────────────────────────────────────
 
 async def create_interaction(
     session: AsyncSession,
@@ -106,13 +185,11 @@ async def create_interaction(
     openpipe_request_id: str,
     notes: str,
 ) -> None:
-    """Insert a turn interaction outcome record."""
-    interaction_uuid = UUID(interaction_id)
-    run_uuid = UUID(run_id)
+    """Insert one per-turn Interaction record."""
     session.add(
         Interaction(
-            id=interaction_uuid,
-            run_id=run_uuid,
+            id=UUID(interaction_id),
+            run_id=UUID(run_id),
             turn=turn,
             monkey_type=monkey_type,
             prompt=prompt,
@@ -132,8 +209,23 @@ async def create_interaction(
             created_at=datetime.now(timezone.utc),
         )
     )
-    await session.commit()
+    # NOTE: caller is responsible for commit() to allow batching
 
+
+async def list_interactions(session: AsyncSession, run_id: str) -> list[Interaction]:
+    """Return all interactions for a run ordered by turn number.
+
+    BUG-9 addition — needed by dashboard and GET /runs/{id}/interactions route.
+    """
+    rows = await session.scalars(
+        select(Interaction)
+        .where(Interaction.run_id == run_id)
+        .order_by(Interaction.turn)
+    )
+    return list(rows)
+
+
+# ── AFP ────────────────────────────────────────────────────────────────────────
 
 async def create_afp(
     session: AsyncSession,
@@ -148,7 +240,7 @@ async def create_afp(
     severity: str,
     recommendation: str,
 ) -> None:
-    """Insert an AFP discovery for long-term memory."""
+    """Insert an AFP discovery record (LTM write)."""
     session.add(
         AFP(
             id=UUID(afp_id),
@@ -164,39 +256,38 @@ async def create_afp(
             created_at=datetime.now(timezone.utc),
         )
     )
-    await session.commit()
+    # NOTE: caller is responsible for commit()
 
 
-async def update_run_final(
-    session: AsyncSession,
-    run_id: str,
-    status: str,
-    blast_radius: str,
-    monkeys_selected: object,
-    overall_srq: float,
-    overall_hrt: float,
-    overall_safety: float,
-    afp_count: int,
-    ethical_drift_score: float,
-    agentic_resilience_score: float,
-    estimated_cost_usd: float,
-    finished_at: datetime,
-) -> None:
-    """Update terminal run record metrics in PostgreSQL."""
-    run_uuid = UUID(run_id)
-    run = await session.scalar(select(Run).where(Run.id == run_uuid))
-    if run is None:
-        return
-    run.status = status
-    run.blast_radius = blast_radius
-    run.monkeys_selected = monkeys_selected
-    run.overall_srq = overall_srq
-    run.overall_hrt = overall_hrt
-    run.overall_safety = overall_safety
-    run.afp_count = afp_count
-    run.ethical_drift_score = ethical_drift_score
-    run.agentic_resilience_score = agentic_resilience_score
-    run.estimated_cost_usd = estimated_cost_usd
-    run.finished_at = finished_at
-    await session.commit()
+async def list_afps_for_run(session: AsyncSession, run_id: str) -> list[AFP]:
+    """Return all AFP records for a run ordered by creation time.
 
+    BUG-9 addition — needed by dashboard and GET /runs/{id}/afps route.
+    """
+    rows = await session.scalars(
+        select(AFP)
+        .where(AFP.run_id == run_id)
+        .order_by(AFP.created_at)
+    )
+    return list(rows)
+
+
+async def load_afp_patterns(
+    session: AsyncSession, agent_id: str, monkey_type: str, limit: int = 10
+) -> list[str]:
+    """Load recent AFP descriptions for one agent and monkey type (DB-layer version)."""
+    rows = await session.scalars(
+        select(AFP.description)
+        .where(AFP.agent_id == agent_id, AFP.monkey_type == monkey_type)
+        .order_by(desc(AFP.created_at))
+        .limit(limit)
+    )
+    return list(rows)
+
+
+async def count_afps_for_run(session: AsyncSession, run_id: str) -> int:
+    """Count AFP records for a run (used for report summary when STM is unavailable)."""
+    result = await session.scalar(
+        select(func.count()).select_from(AFP).where(AFP.run_id == run_id)
+    )
+    return result or 0

@@ -1,8 +1,13 @@
-"""SQLAlchemy ORM models for ChaosAgent persistent storage."""
+"""SQLAlchemy ORM models for ChaosAgent persistent storage.
+
+Fix applied: replaced all `datetime.utcnow()` defaults with
+`datetime.now(timezone.utc)` — `utcnow()` is deprecated in Python 3.12+
+and removed in 3.14. The timezone-aware form is the correct replacement.
+"""
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Any
 from uuid import uuid4
 
@@ -16,15 +21,13 @@ class Base(DeclarativeBase):
 
 
 class User(Base):
-    """Represents an authenticated ChaosAgent user."""
-
     __tablename__ = "users"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
     agents: Mapped[list["Agent"]] = relationship(back_populates="user")
@@ -35,8 +38,6 @@ class User(Base):
 
 
 class Agent(Base):
-    """Stores target agent registration and normalized card configuration."""
-
     __tablename__ = "agents"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -48,7 +49,7 @@ class Agent(Base):
     config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     raw_card: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
     user: Mapped[User] = relationship(back_populates="agents")
@@ -61,8 +62,6 @@ class Agent(Base):
 
 
 class SteadyState(Base):
-    """Baseline metrics captured for an agent before chaos experiments."""
-
     __tablename__ = "steady_states"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -76,7 +75,7 @@ class SteadyState(Base):
     baseline_cost_per_task: Mapped[float] = mapped_column(Float, nullable=False)
     sample_size: Mapped[int] = mapped_column(Integer, nullable=False)
     captured_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
     agent: Mapped[Agent] = relationship(back_populates="steady_states")
@@ -86,8 +85,6 @@ class SteadyState(Base):
 
 
 class Run(Base):
-    """A single chaos experiment run and its aggregate outcomes."""
-
     __tablename__ = "runs"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -109,7 +106,7 @@ class Run(Base):
     agentic_resilience_score: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     estimated_cost_usd: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
     started_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
     finished_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=True)
 
@@ -123,8 +120,6 @@ class Run(Base):
 
 
 class Interaction(Base):
-    """Per-turn interaction outcome inside a chaos run."""
-
     __tablename__ = "interactions"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -148,7 +143,7 @@ class Interaction(Base):
     openpipe_request_id: Mapped[str] = mapped_column(String(255), nullable=False, default="")
     notes: Mapped[str] = mapped_column(Text, nullable=False, default="")
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
     run: Mapped[Run] = relationship(back_populates="interactions")
@@ -159,8 +154,6 @@ class Interaction(Base):
 
 
 class AFP(Base):
-    """Autonomy fracture point discovery persisted for long-term memory."""
-
     __tablename__ = "afps"
 
     id: Mapped[str] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid4)
@@ -183,7 +176,7 @@ class AFP(Base):
     severity: Mapped[str] = mapped_column(String(16), nullable=False)
     recommendation: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
-        DateTime(timezone=True), nullable=False, default=datetime.utcnow
+        DateTime(timezone=True), nullable=False, default=lambda: datetime.now(timezone.utc)
     )
 
     run: Mapped[Run] = relationship(back_populates="afps")
@@ -192,4 +185,3 @@ class AFP(Base):
 
     def __repr__(self) -> str:
         return f"AFP(id={self.id!s}, run_id={self.run_id!s}, severity={self.severity!r})"
-

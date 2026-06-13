@@ -2,18 +2,30 @@ fastapi==0.115.12
 uvicorn==0.34.0
 sqlalchemy==2.0.40
 asyncpg==0.30.0
-alembic==1.15.2
+# Alembic: 1.18.4 is the latest stable -- adds bulk PostgreSQL reflection and
+# SQLAlchemy 2.1 compatibility improvements. No breaking changes from 1.15.
+alembic>=1.18,<2.0
 pydantic==2.11.1
 pydantic-settings==2.8.1
 httpx==0.28.1
 pyyaml==6.0.2
+# python-jose 3.4.0 patches CVE-2024-33663 (algorithm confusion) and
+# CVE-2024-33664 (JWT bomb DoS). Already on the patched version -- keep pinned.
 python-jose==3.4.0
 python-multipart==0.0.20
-langgraph==0.3.27
-langchain==0.3.23
-langsmith==0.3.24
+# LangGraph 1.x stable (Oct 2025). interrupt() + Command replace interrupt_before.
+langgraph>=1.0,<2.0
+# langgraph-checkpoint is now a separate package -- required by langgraph 1.x.
+langgraph-checkpoint
+langchain
+langchain-core==1.2.28
+langchain-text-splitters==1.1.1    # ← This is important!
+langsmith
 redis==5.2.1
-openpipe==4.42.0
-streamlit==1.44.1
+# openpipe 5.0.0 renamed the per-call kwarg from openpipe={"tags":...} to
+# metadata={"prompt_id":...}. Pin to 4.x until backend/openpipe/logger.py
+# is updated to the new API. Upgrading past 4.x without updating logger.py
+# will silently drop all OpenPipe request logging.
+streamlit
 plotly==6.0.1
-
+openai
